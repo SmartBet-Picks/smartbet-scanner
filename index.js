@@ -1,114 +1,107 @@
-import express from 'express'
-import fetch from 'node-fetch'
-import { createClient } from '@supabase/supabase-js'
+import express from "express";
+import fetch from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
 
-const app = express()
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// ENV VARIABLES
-const ODDS_API_KEY = process.env.ODDS_API_KEY
-const SUPABASE_URL = process.env.SUPABASE_URL
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
-const REGION = process.env.REGION || 'us'
-const BOOKMAKER = process.env.BOOKMAKER || 'draftkings'
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { db: { schema: "public" } }
+);
 
-// SUPABASE CLIENT
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const REGION = process.env.REGION || "us";
+const BOOKMAKER = process.env.BOOKMAKER || "draftkings";
 
-// ROOT CHECK
-app.get('/', (req, res) => {
-  res.send('SmartBet scanner live')
-})
+app.get("/", (req, res) => {
+  res.send("SmartBet scanner live");
+});
 
-// MAIN SCANNER
-app.get('/scan', async (req, res) => {
+app.get("/scan", async (req, res) => {
   try {
-    const sports = [
-      'basketball_nba',
-      'americanfootball_nfl',
-      'mma_mixed_martial_arts'
-    ]
-
-    let allPicks = []
+    const sports = ["basketball_nba", "baseball_mlb", "americanfootball_nfl", "mma_mixed_martial_arts"];
+    let picks = [];
 
     for (const sport of sports) {
-      const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?regions=${REGION}&markets=h2h&apiKey=${ODDS_API_KEY}`
+      const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?apiKey=${ODDS_API_KEY}&regions=${REGION}&bookmakers=${BOOKMAKER}&markets=h2h&oddsFormat=american`;
 
-      const response = await fetch(url)
-      const data = await response.json()
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (!Array.isArray(data)) continue;
 
       for (const game of data) {
-        if (!game.bookmakers) continue
+        const gameName = `${game.away_team} @ ${game.home_team}`;
 
-        const book = game.bookmakers.find(b => b.key === BOOKMAKER)
-        if (!book) continue
+        for (const book of game.bookmakers || []) {
+          for (const market of book.markets || []) {
+            for (const outcome of market.outcomes || []) {
+              const odds = Number(outcome.price);
+              let confidence = 60;
 
-        const market = book.markets.find(m => m.key === 'h2h')
-        if (!market) continue
+              if (odds <= -200) confidence = 85;
+              else if (odds <= -150) confidence = 75;
+              else if (odds >= 150) confidence = 55;
 
-        for (const outcome of market.outcomes) {
-          const odds = outcome.price
-
-          // SIMPLE CONFIDENCE MODEL
-          let confidence = 50
-          if (odds < -150) confidence = 75
-          if (odds < -200) confidence = 85
-          if (odds > 150) confidence = 55
-
-          const pick = {
-            sport,
-            game: `${game.home_team} vs ${game.away_team}`,
-            market: 'moneyline',
-            pick: outcome.name,
-            odds,
-            confidence,
-            book: BOOKMAKER
+              picks.push({
+                sport,
+                game: gameName,
+                market: "moneyline",
+                pick: outcome.name,
+                odds,
+                confidence,
+                book: book.key || BOOKMAKER
+              });
+            }
           }
-
-          allPicks.push(pick)
         }
       }
     }
 
-    // 🔥 CLEAR OLD PICKS (IMPORTANT)
-    await supabase.from('picks').delete().neq('id', 0)
+    const { error: deleteError } = await supabase
+      .from("picks")
+      .delete()
+      .neq("id", 0);
 
-    // 🔥 INSERT PICKS INTO SUPABASE
-    let inserted = 0
+    if (deleteError) {
+      return res.status(500).json({
+        success: false,
+        step: "delete_old_picks",
+        error: deleteError.message
+      });
+    }
 
-    for (const pick of allPicks) {
-      const { error } = await supabase
-        .from('picks')
-        .insert([
-          {
-            sport: pick.sport,
-            game: pick.game,
-            market: pick.market,
-            pick: pick.pick,
-            odds: pick.odds,
-            confidence: pick.confidence,
-            book: pick.book,
-            created_at: new Date()
-          }
-        ])
+    const { data: insertedRows, error: insertError } = await supabase
+      .from("picks")
+      .insert(picks)
+      .select();
 
-      if (!error) inserted++
-      else console.log('Insert error:', error)
+    if (insertError) {
+      return res.status(500).json({
+        success: false,
+        step: "insert_picks",
+        error: insertError.message,
+        sample_pick: picks[0]
+      });
     }
 
     res.json({
       success: true,
-      total_picks: allPicks.length,
-      inserted
-    })
+      total_picks_found: picks.length,
+      inserted: insertedRows.length
+    });
 
   } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Scanner failed' })
+    res.status(500).json({
+      success: false,
+      step: "main_error",
+      error: err.message
+    });
   }
-})
+});
 
-// PORT
-const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
-})
+  console.log(`Running on port ${PORT}`);
+});
