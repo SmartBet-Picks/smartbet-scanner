@@ -48,82 +48,56 @@ function riskLabel(score) {
   return "High Risk";
 }
 
-function buildReason(score, odds, pick, market) {
-  if (score >= 85) {
-    return `${pick} grades as an elite ${market} pick because it falls into a stronger playable odds range with a higher SmartBet confidence score.`;
-  }
-
-  if (score >= 75) {
-    return `${pick} grades as a strong ${market} pick with a balanced risk profile and solid slip-building value.`;
-  }
-
-  if (score >= 70) {
-    return `${pick} qualifies as a playable ${market} pick with moderate upside, best used in balanced or aggressive builds.`;
-  }
-
-  return `${pick} did not grade high enough for premium SmartBet placement.`;
+function buildReason(score, odds, pick) {
+  if (score >= 85) return `${pick} grades as an elite play with strong odds positioning and high confidence.`;
+  if (score >= 75) return `${pick} offers strong value with balanced risk and solid win probability.`;
+  if (score >= 70) return `${pick} is a playable option with moderate upside.`;
+  return `${pick} did not meet elite SmartBet criteria.`;
 }
 
 function removeDuplicateGames(picks) {
-  const seenGames = new Set();
-  const clean = [];
-
-  for (const pick of picks) {
-    if (seenGames.has(pick.game)) continue;
-    seenGames.add(pick.game);
-    clean.push(pick);
-  }
-
-  return clean;
+  const seen = new Set();
+  return picks.filter(p => {
+    if (seen.has(p.game)) return false;
+    seen.add(p.game);
+    return true;
+  });
 }
 
 function buildSections(picks) {
-  const sorted = [...picks]
-    .filter(p => p.score >= 70)
-    .sort((a, b) => b.score - a.score);
-
-  const noDuplicateGames = removeDuplicateGames(sorted);
-
-  const freePick = noDuplicateGames.slice(0, 1).map(p => ({
-    ...p,
-    section: "Free Pick"
-  }));
-
-  const top5 = noDuplicateGames.slice(0, 5).map(p => ({
-    ...p,
-    section: "Top 5 Locks"
-  }));
-
-  const safeSlip = noDuplicateGames
-    .filter(p => p.score >= 85)
-    .slice(0, 3)
-    .map(p => ({ ...p, section: "Safe Slip" }));
-
-  const balancedSlip = noDuplicateGames
-    .filter(p => p.score >= 75)
-    .slice(0, 5)
-    .map(p => ({ ...p, section: "Balanced Slip" }));
-
-  const aggressiveSlip = noDuplicateGames
-    .filter(p => p.score >= 70)
-    .slice(0, 6)
-    .map(p => ({ ...p, section: "Aggressive Slip" }));
+  const sorted = removeDuplicateGames(
+    picks
+      .filter(p => p.score >= 70)
+      .sort((a, b) => b.score - a.score)
+  );
 
   return [
-    ...freePick,
-    ...top5,
-    ...safeSlip,
-    ...balancedSlip,
-    ...aggressiveSlip
+    ...sorted.slice(0, 1).map(p => ({ ...p, section: "Free Pick" })),
+    ...sorted.slice(0, 5).map(p => ({ ...p, section: "Top 5 Locks" })),
+    ...sorted.filter(p => p.score >= 85).slice(0, 3).map(p => ({ ...p, section: "Safe Slip" })),
+    ...sorted.filter(p => p.score >= 75).slice(0, 5).map(p => ({ ...p, section: "Balanced Slip" })),
+    ...sorted.filter(p => p.score >= 70).slice(0, 6).map(p => ({ ...p, section: "Aggressive Slip" }))
   ];
 }
 
-app.get("/", (req, res) => {
-  res.send("SmartBet elite scanner live");
-});
+function isSameDay(eventTime) {
+  const eventDate = new Date(eventTime);
+  const today = new Date();
+
+  return (
+    eventDate.getFullYear() === today.getFullYear() &&
+    eventDate.getMonth() === today.getMonth() &&
+    eventDate.getDate() === today.getDate()
+  );
+}
+
+function makeScanId() {
+  return `scan_${new Date().toISOString()}`;
+}
 
 app.get("/scan", async (req, res) => {
   try {
+    const scanId = makeScanId();
     let rawPicks = [];
 
     for (const sport of SPORTS) {
@@ -144,44 +118,33 @@ app.get("/scan", async (req, res) => {
         if (!game.bookmakers) continue;
 
         const gameName = `${game.away_team} @ ${game.home_team}`;
+        const commenceTime = game.commence_time;
 
         for (const book of game.bookmakers) {
-          if (!book.markets) continue;
-
-          for (const market of book.markets) {
+          for (const market of book.markets || []) {
             if (market.key !== "h2h") continue;
 
             for (const outcome of market.outcomes || []) {
               const odds = Number(outcome.price);
 
-              // Elite filter: removes extreme favorite traps and weak longshots
               if (!odds || odds < -220 || odds > 200) continue;
 
               const score = scorePick(odds);
-
-              // Elite filter: only keep strong SmartBet grades
               if (score < 70) continue;
-
-              const risk = riskLabel(score);
-              const stake = 10;
-              const profit = calcProfit(odds, stake);
-              const payout = +(stake + profit).toFixed(2);
-              const pickName = `${outcome.name} Moneyline`;
 
               rawPicks.push({
                 sport,
                 game: gameName,
-                market: "moneyline",
-                pick: pickName,
+                commence_time: commenceTime,
+                pick: `${outcome.name} Moneyline`,
                 odds,
                 confidence: score,
                 score,
-                risk,
-                reason: buildReason(score, odds, pickName, "moneyline"),
-                book: book.key || BOOKMAKER,
-                stake,
-                profit,
-                payout,
+                risk: riskLabel(score),
+                reason: buildReason(score, odds, outcome.name),
+                stake: 10,
+                profit: calcProfit(odds),
+                payout: calcProfit(odds) + 10,
                 bet_link: BET_LINK
               });
             }
@@ -190,67 +153,51 @@ app.get("/scan", async (req, res) => {
       }
     }
 
-    const finalPicks = buildSections(rawPicks);
+    // 🎯 FILTER TODAY PICKS
+    let todayPicks = rawPicks.filter(p => isSameDay(p.commence_time));
 
-    const { error: deleteError } = await supabase
-      .from("picks")
-      .delete()
-      .neq("id", 0);
-
-    if (deleteError) {
-      return res.status(500).json({
-        success: false,
-        step: "delete_old_picks",
-        error: deleteError.message
-      });
+    // 🔄 FALLBACK IF NONE TODAY
+    if (todayPicks.length === 0) {
+      todayPicks = rawPicks;
     }
 
-    if (finalPicks.length === 0) {
-      return res.json({
-        success: true,
-        message: "Scanner ran successfully, but no elite picks passed the filters.",
-        raw_picks_found: rawPicks.length,
-        inserted: 0
-      });
-    }
+    const finalPicks = buildSections(todayPicks);
 
-    const { data: insertedRows, error: insertError } = await supabase
+    // SAVE HISTORY
+    const historyRows = finalPicks.map(p => ({
+      ...p,
+      scan_id: scanId,
+      result: "Pending"
+    }));
+
+    await supabase.from("pick_history").insert(historyRows);
+
+    // REFRESH LIVE PICKS
+    await supabase.from("picks").delete().neq("id", 0);
+
+    const { data: inserted } = await supabase
       .from("picks")
       .insert(finalPicks)
       .select();
 
-    if (insertError) {
-      return res.status(500).json({
-        success: false,
-        step: "insert_picks",
-        error: insertError.message,
-        sample_pick: finalPicks[0]
-      });
-    }
-
     res.json({
       success: true,
-      mode: "elite",
+      mode: "elite_tracking_same_day",
+      scan_id: scanId,
       raw_picks_found: rawPicks.length,
-      inserted: insertedRows.length,
-      sections: {
-        free_pick: finalPicks.filter(p => p.section === "Free Pick").length,
-        top_5_locks: finalPicks.filter(p => p.section === "Top 5 Locks").length,
-        safe_slip: finalPicks.filter(p => p.section === "Safe Slip").length,
-        balanced_slip: finalPicks.filter(p => p.section === "Balanced Slip").length,
-        aggressive_slip: finalPicks.filter(p => p.section === "Aggressive Slip").length
-      }
+      today_picks: todayPicks.length,
+      inserted_live: inserted.length,
+      inserted_history: historyRows.length
     });
 
   } catch (err) {
     res.status(500).json({
       success: false,
-      step: "main_error",
       error: err.message
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`SmartBet elite scanner running on port ${PORT}`);
+  console.log("SmartBet Elite Scanner v2 running");
 });
