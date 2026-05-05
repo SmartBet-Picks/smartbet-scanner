@@ -156,7 +156,7 @@ function cleanForDatabase(pick) {
 }
 
 app.get("/", (req, res) => {
-  res.send("SmartBet elite scanner with tracking and same-day filter live");
+  res.send("SmartBet elite scanner with tracking, same-day filter, and testing grade endpoint live");
 });
 
 app.get("/scan", async (req, res) => {
@@ -319,6 +319,70 @@ app.get("/scan", async (req, res) => {
     res.status(500).json({
       success: false,
       step: "main_error",
+      error: err.message
+    });
+  }
+});
+
+app.get("/grade", async (req, res) => {
+  try {
+    const { data: pendingPicks, error: fetchError } = await supabase
+      .from("pick_history")
+      .select("*")
+      .eq("result", "Pending");
+
+    if (fetchError) {
+      return res.status(500).json({
+        success: false,
+        step: "fetch_pending_picks",
+        error: fetchError.message
+      });
+    }
+
+    if (!pendingPicks || pendingPicks.length === 0) {
+      return res.json({
+        success: true,
+        mode: "testing_random_grade",
+        message: "No pending picks to grade.",
+        graded: 0
+      });
+    }
+
+    let graded = 0;
+    let wins = 0;
+    let losses = 0;
+
+    for (const pick of pendingPicks) {
+      const result = Math.random() > 0.5 ? "Win" : "Loss";
+
+      const { error: updateError } = await supabase
+        .from("pick_history")
+        .update({
+          result,
+          graded_at: new Date().toISOString()
+        })
+        .eq("id", pick.id);
+
+      if (!updateError) {
+        graded++;
+        if (result === "Win") wins++;
+        if (result === "Loss") losses++;
+      }
+    }
+
+    res.json({
+      success: true,
+      mode: "testing_random_grade",
+      warning: "This endpoint randomly grades picks for dashboard testing only. Do not use for real posted results.",
+      graded,
+      wins,
+      losses
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      step: "grade_error",
       error: err.message
     });
   }
