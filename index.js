@@ -155,8 +155,48 @@ function cleanForDatabase(pick) {
   };
 }
 
+function getWinnerFromScoreGame(game) {
+  if (!game || !game.completed || !Array.isArray(game.scores)) return null;
+
+  const home = game.scores.find(s => s.name === game.home_team);
+  const away = game.scores.find(s => s.name === game.away_team);
+
+  if (!home || !away) return null;
+
+  const homeScore = Number(home.score);
+  const awayScore = Number(away.score);
+
+  if (Number.isNaN(homeScore) || Number.isNaN(awayScore)) return null;
+  if (homeScore > awayScore) return game.home_team;
+  if (awayScore > homeScore) return game.away_team;
+
+  return null;
+}
+
+function normalizeText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, "")
+    .trim();
+}
+
+function gameMatchesPick(scoreGame, pickGame) {
+  const pickGameText = normalizeText(pickGame);
+  const home = normalizeText(scoreGame.home_team);
+  const away = normalizeText(scoreGame.away_team);
+
+  return pickGameText.includes(home) && pickGameText.includes(away);
+}
+
+function pickTeamWon(pickText, winningTeam) {
+  const pick = normalizeText(pickText);
+  const winner = normalizeText(winningTeam);
+
+  return pick.includes(winner);
+}
+
 app.get("/", (req, res) => {
-  res.send("SmartBet elite scanner with tracking, same-day filter, and testing grade endpoint live");
+  res.send("SmartBet elite scanner with real moneyline grading live");
 });
 
 app.get("/scan", async (req, res) => {
@@ -329,12 +369,13 @@ app.get("/grade", async (req, res) => {
     const { data: pendingPicks, error: fetchError } = await supabase
       .from("pick_history")
       .select("*")
-      .eq("result", "Pending");
+      .eq("result", "Pending")
+      .eq("market", "moneyline");
 
     if (fetchError) {
       return res.status(500).json({
         success: false,
-        step: "fetch_pending_picks",
+        step: "fetch_pending_moneyline_picks",
         error: fetchError.message
       });
     }
@@ -342,52 +383,91 @@ app.get("/grade", async (req, res) => {
     if (!pendingPicks || pendingPicks.length === 0) {
       return res.json({
         success: true,
-        mode: "testing_random_grade",
-        message: "No pending picks to grade.",
+        mode: "real_moneyline_grading_v1",
+        message: "No pending moneyline picks to grade.",
         graded: 0
       });
+    }
+
+    let allScoreGames = [];
+
+    for (const sport of SPORTS) {
+      const scoreUrl =
+        `https://api.the-odds-api.com/v4/sports/${sport}/scores/` +
+        `?apiKey=${ODDS_API_KEY}` +
+        `&daysFrom=3`;
+
+      const scoreResponse = await fetch(scoreUrl);
+      const scoreData = await scoreResponse.json();
+
+      if (Array.isArray(scoreData)) {
+        allScoreGames.push(...scoreData.map(g => ({ ...g, sport })));
+      }
     }
 
     let graded = 0;
     let wins = 0;
     let losses = 0;
+    let skipped = 0;
 
     for (const pick of pendingPicks) {
-      const result = Math.random() > 0.5 ? "Win" : "Loss";
+      const scoreGame = allScoreGames.find(g =>
+        g.sport === pick.sport && gameMatchesPick(g, pick.game)
+      );
+
+      if (!scoreGame || !scoreGame.completed) {
+        skipped++;
+        continue;
+      }
+
+      const winningTeam = getWinnerFromScoreGame(scoreGame);
+
+      if (!winningTeam) {
+        skipped++;
+        continue;
+      }
+
+      const result = pickTeamWon(pick.pick, winningTeam) ? "Win" : "Loss";
 
       const { error: updateError } = await supabase
         .from("pick_history")
         .update({
           result,
+          actual_result: `${winningTeam} won`,
           graded_at: new Date().toISOString()
         })
         .eq("id", pick.id);
 
-      if (!updateError) {
-        graded++;
-        if (result === "Win") wins++;
-        if (result === "Loss") losses++;
+      if (updateError) {
+        skipped++;
+        continue;
       }
+
+      graded++;
+      if (result === "Win") wins++;
+      if (result === "Loss") losses++;
     }
 
     res.json({
       success: true,
-      mode: "testing_random_grade",
-      warning: "This endpoint randomly grades picks for dashboard testing only. Do not use for real posted results.",
+      mode: "real_moneyline_grading_v1",
+      pending_checked: pendingPicks.length,
       graded,
       wins,
-      losses
+      losses,
+      skipped,
+      note: "Only completed moneyline games are graded. Pending or unmatched games are skipped."
     });
 
   } catch (err) {
     res.status(500).json({
       success: false,
-      step: "grade_error",
+      step: "real_grade_error",
       error: err.message
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`SmartBet elite scanner with tracking running on port ${PORT}`);
+  console.log(`SmartBet elite scanner with real grading running on port ${PORT}`);
 });
