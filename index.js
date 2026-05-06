@@ -422,6 +422,39 @@ app.get("/grade", async (req, res) => {
   }
 });
 
+app.get("/debug-scores", async (req, res) => {
+  try {
+    const scoreUrl =
+      `https://api.the-odds-api.com/v4/sports/basketball_nba/scores/` +
+      `?apiKey=${ODDS_API_KEY}` +
+      `&daysFrom=3`;
+
+    const scoreResponse = await fetch(scoreUrl);
+    const scoreData = await scoreResponse.json();
+
+    const cleDet = Array.isArray(scoreData)
+      ? scoreData.filter(g =>
+          String(g.home_team || "").toLowerCase().includes("detroit") ||
+          String(g.away_team || "").toLowerCase().includes("detroit") ||
+          String(g.home_team || "").toLowerCase().includes("cleveland") ||
+          String(g.away_team || "").toLowerCase().includes("cleveland")
+        )
+      : scoreData;
+
+    res.json({
+      success: true,
+      games_found: Array.isArray(scoreData) ? scoreData.length : 0,
+      cle_det_matches: cleDet
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`SmartBet elite scanner with fixed real grading running on port ${PORT}`);
 });
