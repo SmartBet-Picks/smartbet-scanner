@@ -155,7 +155,7 @@ function getWinnerFromScoreGame(game) {
 }
 
 app.get("/", (req, res) => {
-  res.send("SmartBet elite scanner with fixed real moneyline grading live");
+  res.send("SmartBet elite scanner with real grading v3 live");
 });
 
 app.get("/scan", async (req, res) => {
@@ -324,7 +324,7 @@ app.get("/grade", async (req, res) => {
     if (!pendingPicks || pendingPicks.length === 0) {
       return res.json({
         success: true,
-        mode: "real_moneyline_grading_v2",
+        mode: "real_moneyline_grading_v3",
         message: "No pending moneyline picks to grade.",
         graded: 0
       });
@@ -350,8 +350,12 @@ app.get("/grade", async (req, res) => {
     let wins = 0;
     let losses = 0;
     let skipped = 0;
-    let matchedButNotComplete = 0;
     let unmatched = 0;
+    let matchedButNotComplete = 0;
+    let noWinnerFound = 0;
+    let updateErrors = [];
+
+    let debugMatchedSamples = [];
 
     for (const pick of pendingPicks) {
       const matchedGame = allScoreGames.find(g =>
@@ -373,24 +377,52 @@ app.get("/grade", async (req, res) => {
 
       const winningTeam = getWinnerFromScoreGame(matchedGame);
 
+      debugMatchedSamples.push({
+        pick_id: pick.id,
+        pick: pick.pick,
+        pick_game: pick.game,
+        matched_home: matchedGame.home_team,
+        matched_away: matchedGame.away_team,
+        completed: matchedGame.completed,
+        scores: matchedGame.scores,
+        winning_team: winningTeam
+      });
+
       if (!winningTeam) {
         skipped++;
+        noWinnerFound++;
         continue;
       }
 
       const result = pickContainsTeam(pick.pick, winningTeam) ? "Win" : "Loss";
 
-      const { error: updateError } = await supabase
+      const { data: updatedRows, error: updateError } = await supabase
         .from("pick_history")
         .update({
           result,
           actual_result: `${winningTeam} won`,
           graded_at: new Date().toISOString()
         })
-        .eq("id", pick.id);
+        .eq("id", pick.id)
+        .select();
 
       if (updateError) {
         skipped++;
+        updateErrors.push({
+          pick_id: pick.id,
+          pick: pick.pick,
+          error: updateError.message
+        });
+        continue;
+      }
+
+      if (!updatedRows || updatedRows.length === 0) {
+        skipped++;
+        updateErrors.push({
+          pick_id: pick.id,
+          pick: pick.pick,
+          error: "No rows updated"
+        });
         continue;
       }
 
@@ -401,7 +433,7 @@ app.get("/grade", async (req, res) => {
 
     res.json({
       success: true,
-      mode: "real_moneyline_grading_v2",
+      mode: "real_moneyline_grading_v3",
       pending_checked: pendingPicks.length,
       score_games_found: allScoreGames.length,
       graded,
@@ -410,6 +442,9 @@ app.get("/grade", async (req, res) => {
       skipped,
       unmatched,
       matched_but_not_complete: matchedButNotComplete,
+      no_winner_found: noWinnerFound,
+      update_errors: updateErrors.slice(0, 10),
+      debug_matched_samples: debugMatchedSamples.slice(0, 5),
       note: "Only completed moneyline games are graded. Pending or unmatched games are skipped."
     });
 
@@ -456,5 +491,5 @@ app.get("/debug-scores", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`SmartBet elite scanner with fixed real grading running on port ${PORT}`);
+  console.log(`SmartBet elite scanner with real grading v3 running on port ${PORT}`);
 });
