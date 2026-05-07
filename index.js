@@ -5,6 +5,18 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, apikey");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
+
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -68,6 +80,7 @@ function isSameDay(eventTime) {
 
 function removeDuplicateGames(picks) {
   const seenGames = new Set();
+
   return picks.filter(pick => {
     if (seenGames.has(pick.game)) return false;
     seenGames.add(pick.game);
@@ -156,8 +169,10 @@ function getWinnerFromScoreGame(game) {
 
 function normalizeResultForStats(result) {
   const r = String(result || "").toLowerCase();
+
   if (r.includes("win")) return "Win";
   if (r.includes("loss") || r.includes("lose")) return "Loss";
+
   return "Pending";
 }
 
