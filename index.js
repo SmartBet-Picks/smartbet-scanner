@@ -68,6 +68,7 @@ function buildReason(score, pick) {
 
 function isSameDay(eventTime) {
   if (!eventTime) return false;
+
   const eventDate = new Date(eventTime);
   const today = new Date();
 
@@ -76,6 +77,34 @@ function isSameDay(eventTime) {
     eventDate.getMonth() === today.getMonth() &&
     eventDate.getDate() === today.getDate()
   );
+}
+
+function sameGameDate(timeA, timeB) {
+  if (!timeA || !timeB) return false;
+
+  const a = new Date(timeA);
+  const b = new Date(timeB);
+
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return false;
+
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function closeGameTime(timeA, timeB) {
+  if (!timeA || !timeB) return false;
+
+  const a = new Date(timeA).getTime();
+  const b = new Date(timeB).getTime();
+
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+
+  const diffHours = Math.abs(a - b) / (1000 * 60 * 60);
+
+  return diffHours <= 12;
 }
 
 function removeDuplicateGames(picks) {
@@ -112,6 +141,7 @@ function cleanForDatabase(pick) {
   return {
     sport: pick.sport,
     game: pick.game,
+    commence_time: pick.commence_time,
     market: pick.market,
     pick: pick.pick,
     odds: pick.odds,
@@ -142,6 +172,17 @@ function gamesMatch(pickGame, homeTeam, awayTeam) {
   const away = normalizeText(awayTeam);
 
   return pg.includes(home) && pg.includes(away);
+}
+
+function exactGameMatch(pick, scoreGame) {
+  if (!pick || !scoreGame) return false;
+
+  const sameSport = pick.sport === scoreGame.sport;
+  const sameTeams = gamesMatch(pick.game, scoreGame.home_team, scoreGame.away_team);
+  const sameDate = sameGameDate(pick.commence_time, scoreGame.commence_time);
+  const closeTime = closeGameTime(pick.commence_time, scoreGame.commence_time);
+
+  return sameSport && sameTeams && sameDate && closeTime;
 }
 
 function pickContainsTeam(pickText, teamName) {
@@ -181,7 +222,7 @@ function moneyValue(num) {
 }
 
 app.get("/", (req, res) => {
-  res.send("SmartBet elite scanner with real grading v4 live");
+  res.send("SmartBet scanner with exact game-date grading live");
 });
 
 app.get("/scan", async (req, res) => {
@@ -259,7 +300,9 @@ app.get("/scan", async (req, res) => {
     const historyRows = finalPicks.map(p => ({
       ...p,
       scan_id: scanId,
-      result: "Pending"
+      result: "Pending",
+      actual_result: null,
+      graded_at: null
     }));
 
     if (historyRows.length > 0) {
@@ -306,7 +349,7 @@ app.get("/scan", async (req, res) => {
 
     res.json({
       success: true,
-      mode: "elite_tracking_same_day",
+      mode: "exact_game_date_tracking",
       scan_id: scanId,
       raw_picks_found: rawPicks.length,
       same_day_picks_found: rawPicks.filter(p => isSameDay(p.commence_time)).length,
@@ -337,7 +380,8 @@ app.get("/grade", async (req, res) => {
       .from("pick_history")
       .select("*")
       .eq("result", "Pending")
-      .eq("market", "moneyline");
+      .eq("market", "moneyline")
+      .not("commence_time", "is", null);
 
     if (fetchError) {
       return res.status(500).json({
@@ -350,8 +394,8 @@ app.get("/grade", async (req, res) => {
     if (!pendingPicks || pendingPicks.length === 0) {
       return res.json({
         success: true,
-        mode: "real_moneyline_grading_v4",
-        message: "No pending moneyline picks to grade.",
+        mode: "exact_game_date_grading",
+        message: "No pending moneyline picks with commence_time to grade.",
         graded: 0
       });
     }
@@ -381,12 +425,10 @@ app.get("/grade", async (req, res) => {
     let noWinnerFound = 0;
     let updateErrors = [];
     let debugMatchedSamples = [];
+    let pendingFutureGames = 0;
 
     for (const pick of pendingPicks) {
-      const matchedGame = allScoreGames.find(g =>
-        g.sport === pick.sport &&
-        gamesMatch(pick.game, g.home_team, g.away_team)
-      );
+      const matchedGame = allScoreGames.find(g => exactGameMatch(pick, g));
 
       if (!matchedGame) {
         skipped++;
@@ -397,6 +439,7 @@ app.get("/grade", async (req, res) => {
       if (!matchedGame.completed) {
         skipped++;
         matchedButNotComplete++;
+        pendingFutureGames++;
         continue;
       }
 
@@ -406,8 +449,10 @@ app.get("/grade", async (req, res) => {
         pick_id: pick.id,
         pick: pick.pick,
         pick_game: pick.game,
+        pick_commence_time: pick.commence_time,
         matched_home: matchedGame.home_team,
         matched_away: matchedGame.away_team,
+        matched_commence_time: matchedGame.commence_time,
         completed: matchedGame.completed,
         scores: matchedGame.scores,
         winning_team: winningTeam
@@ -429,6 +474,7 @@ app.get("/grade", async (req, res) => {
           graded_at: new Date().toISOString()
         })
         .eq("id", pick.id)
+        .eq("result", "Pending")
         .select();
 
       if (updateError) {
@@ -458,7 +504,7 @@ app.get("/grade", async (req, res) => {
 
     res.json({
       success: true,
-      mode: "real_moneyline_grading_v4",
+      mode: "exact_game_date_grading",
       pending_checked: pendingPicks.length,
       score_games_found: allScoreGames.length,
       graded,
@@ -467,16 +513,17 @@ app.get("/grade", async (req, res) => {
       skipped,
       unmatched,
       matched_but_not_complete: matchedButNotComplete,
+      pending_future_games: pendingFutureGames,
       no_winner_found: noWinnerFound,
       update_errors: updateErrors.slice(0, 10),
       debug_matched_samples: debugMatchedSamples.slice(0, 5),
-      note: "Only completed moneyline games are graded. Pending or unmatched games are skipped."
+      note: "Only completed moneyline games are graded when sport, teams, game date, and game time match."
     });
 
   } catch (err) {
     res.status(500).json({
       success: false,
-      step: "real_grade_error",
+      step: "exact_grade_error",
       error: err.message
     });
   }
@@ -552,27 +599,65 @@ app.get("/results-summary", async (req, res) => {
 
 app.get("/debug-scores", async (req, res) => {
   try {
-    const scoreUrl =
-      `https://api.the-odds-api.com/v4/sports/basketball_nba/scores/` +
-      `?apiKey=${ODDS_API_KEY}` +
-      `&daysFrom=3`;
+    let allScoreGames = [];
 
-    const scoreResponse = await fetch(scoreUrl);
-    const scoreData = await scoreResponse.json();
+    for (const sport of SPORTS) {
+      const scoreUrl =
+        `https://api.the-odds-api.com/v4/sports/${sport}/scores/` +
+        `?apiKey=${ODDS_API_KEY}` +
+        `&daysFrom=3`;
 
-    const cleDet = Array.isArray(scoreData)
-      ? scoreData.filter(g =>
-          String(g.home_team || "").toLowerCase().includes("detroit") ||
-          String(g.away_team || "").toLowerCase().includes("detroit") ||
-          String(g.home_team || "").toLowerCase().includes("cleveland") ||
-          String(g.away_team || "").toLowerCase().includes("cleveland")
-        )
-      : scoreData;
+      const scoreResponse = await fetch(scoreUrl);
+      const scoreData = await scoreResponse.json();
+
+      if (Array.isArray(scoreData)) {
+        allScoreGames.push(...scoreData.map(g => ({ ...g, sport })));
+      }
+    }
 
     res.json({
       success: true,
-      games_found: Array.isArray(scoreData) ? scoreData.length : 0,
-      cle_det_matches: cleDet
+      mode: "debug_all_scores",
+      games_found: allScoreGames.length,
+      games: allScoreGames.map(g => ({
+        sport: g.sport,
+        home_team: g.home_team,
+        away_team: g.away_team,
+        commence_time: g.commence_time,
+        completed: g.completed,
+        scores: g.scores
+      }))
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+app.get("/debug-pending", async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from("pick_history")
+      .select("id,sport,pick,game,commence_time,result,actual_result,graded_at,inserted_at")
+      .eq("result", "Pending")
+      .order("inserted_at", { ascending: false })
+      .limit(50);
+
+    if (error) {
+      return res.status(500).json({
+        success: false,
+        step: "debug_pending_fetch",
+        error: error.message
+      });
+    }
+
+    res.json({
+      success: true,
+      pending_found: rows ? rows.length : 0,
+      rows
     });
 
   } catch (err) {
@@ -584,5 +669,5 @@ app.get("/debug-scores", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`SmartBet elite scanner with real grading v4 running on port ${PORT}`);
+  console.log(`SmartBet scanner with exact game-date grading running on port ${PORT}`);
 });
