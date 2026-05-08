@@ -1,5 +1,15 @@
 require("dotenv").config();
 
+let fetchFn = global.fetch;
+
+if (!fetchFn) {
+  try {
+    fetchFn = require("node-fetch");
+  } catch (error) {
+    console.warn("node-fetch is not installed and global fetch is unavailable.");
+  }
+}
+
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
@@ -15,10 +25,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
-if (!ODDS_API_KEY) console.warn("Missing ODDS_API_KEY");
-if (!SUPABASE_URL) console.warn("Missing SUPABASE_URL");
-if (!SUPABASE_SERVICE_ROLE_KEY) console.warn("Missing SUPABASE_SERVICE_ROLE_KEY");
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const BOOKMAKER_KEY = "draftkings";
@@ -32,8 +38,6 @@ const SPORTS = [
   { key: "americanfootball_nfl", label: "NFL" },
   { key: "mma_mixed_martial_arts", label: "UFC" }
 ];
-
-const SECTIONS = ["Top 5 Locks", "Safe Slip", "Balanced Slip", "Aggressive Slip", "Free Pick"];
 
 function nowISO() {
   return new Date().toISOString();
@@ -94,14 +98,11 @@ function getTrapWarning({ odds, impliedProbability, confidence, edge }) {
   return "None";
 }
 
-function confidenceEngineV2({ odds, homeTeam, awayTeam, teamName }) {
+function confidenceEngineV2({ odds, homeTeam, teamName }) {
   const implied = americanToImpliedProbability(odds);
   let confidence = 60;
 
-  if (implied != null) {
-    confidence += Math.min(18, implied * 20);
-  }
-
+  if (implied != null) confidence += Math.min(18, implied * 20);
   if (odds < 0) confidence += 5;
   if (odds <= -160) confidence += 3;
   if (odds >= 120) confidence -= 3;
@@ -157,12 +158,14 @@ function uniqueByGameAndTeam(picks) {
 }
 
 async function fetchJson(url) {
-  const res = await fetch(url);
+  if (!fetchFn) {
+    throw new Error("Fetch is unavailable. Use Node 18+ on Railway or add node-fetch to package.json.");
+  }
+
+  const res = await fetchFn(url);
   const text = await res.text();
 
-  if (!res.ok) {
-    throw new Error(`Fetch failed ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw new Error(`Fetch failed ${res.status}: ${text}`);
 
   try {
     return JSON.parse(text);
@@ -193,6 +196,7 @@ app.get("/", (req, res) => {
     stack: "Shopify + Railway + Supabase + Odds API",
     bookmaker: "DraftKings only",
     market: "Moneyline",
+    fetch_ready: !!fetchFn,
     routes: [
       "/",
       "/scan",
@@ -223,8 +227,6 @@ app.get("/scan", async (req, res) => {
       const games = await fetchJson(url);
 
       for (const game of games || []) {
-        const commenceTime = game.commence_time;
-        const gameDate = toDateOnly(commenceTime);
         const bookmaker = (game.bookmakers || []).find(b => b.key === BOOKMAKER_KEY);
         if (!bookmaker) continue;
 
@@ -236,25 +238,24 @@ app.get("/scan", async (req, res) => {
           const odds = Number(outcome.price);
           if (!teamName || !Number.isFinite(odds)) continue;
 
-          const impliedProbability = americanToImpliedProbability(odds);
+          const impliedRaw = americanToImpliedProbability(odds);
           const confidence = confidenceEngineV2({
             odds,
             homeTeam: game.home_team,
-            awayTeam: game.away_team,
             teamName
           });
 
-          const edge = calculateEdge(impliedProbability, confidence);
-          const marketConfidence = getMarketConfidence(impliedProbability, odds);
-          const volatility = getVolatility(odds, impliedProbability);
+          const edge = calculateEdge(impliedRaw, confidence);
+          const marketConfidence = getMarketConfidence(impliedRaw, odds);
+          const volatility = getVolatility(odds, impliedRaw);
           const trapWarning = getTrapWarning({
             odds,
-            impliedProbability,
+            impliedProbability: impliedRaw,
             confidence,
             edge
           });
 
-          const pick = {
+          allPicks.push({
             sport: sport.label,
             sport_key: sport.key,
             event_id: game.id || null,
@@ -266,31 +267,27 @@ app.get("/scan", async (req, res) => {
             market: "Moneyline",
             bookmaker: "DraftKings",
             odds,
-            implied_probability:
-              impliedProbability == null ? null : Number((impliedProbability * 100).toFixed(2)),
+            implied_probability: impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
             confidence,
             edge,
             risk: getRiskLabel(confidence, odds),
             market_confidence: marketConfidence,
             volatility,
             trap_warning: trapWarning,
-            commence_time: commenceTime,
-            game_date: gameDate,
+            commence_time: game.commence_time,
+            game_date: toDateOnly(game.commence_time),
             status: "Pending",
             result: "Pending",
             actual_result: null,
             graded_at: null,
             created_at: nowISO(),
             updated_at: nowISO()
-          };
-
-          allPicks.push(pick);
+          });
         }
       }
     }
 
-    const uniquePicks = uniqueByGameAndTeam(allPicks);
-    const finalPicks = assignSections(uniquePicks)
+    const finalPicks = assignSections(uniqueByGameAndTeam(allPicks))
       .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0))
       .slice(0, 40);
 
@@ -364,8 +361,7 @@ app.get("/grade", async (req, res) => {
       const pickDate = toDateOnly(pick.commence_time);
 
       const match = (scores || []).find(game => {
-        const scoreDate = toDateOnly(game.commence_time);
-        const sameDate = scoreDate === pickDate;
+        const sameDate = toDateOnly(game.commence_time) === pickDate;
         const sameHome = normalizeTeam(game.home_team) === normalizeTeam(pick.home_team);
         const sameAway = normalizeTeam(game.away_team) === normalizeTeam(pick.away_team);
         return sameDate && sameHome && sameAway;
