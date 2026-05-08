@@ -113,12 +113,19 @@ function makeScanId() {
 }
 
 function cleanForDatabase(pick) {
+
+  const teamName =
+    String(pick.pick || "")
+      .replace(" Moneyline","")
+      .trim();
+
   return {
     sport: pick.sport,
     game: pick.game,
     commence_time: pick.commence_time,
     market: pick.market,
     pick: pick.pick,
+    team_name: teamName,
     odds: pick.odds,
     confidence: pick.confidence,
     score: pick.score,
@@ -672,6 +679,191 @@ app.get("/debug-pending", async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+app.get("/trend-summary", async (req, res) => {
+
+  try {
+
+    const { data: rows, error } = await supabase
+      .from("pick_history")
+      .select("*")
+      .in("result", ["Win","Loss"]);
+
+    if (error) {
+      return res.status(500).json({
+        success:false,
+        step:"trend_fetch",
+        error:error.message
+      });
+    }
+
+    const allRows = Array.isArray(rows) ? rows : [];
+
+    const uniqueRows = uniquePickRows(allRows);
+
+    function byKey(rows,key){
+
+      return rows.reduce((acc,row)=>{
+
+        const value = row[key] || "Unknown";
+
+        if(!acc[value]) acc[value] = [];
+
+        acc[value].push(row);
+
+        return acc;
+
+      },{});
+    }
+
+    function stats(rows){
+
+      const wins =
+        rows.filter(r =>
+          normalizeResultForStats(r.result) === "Win"
+        ).length;
+
+      const losses =
+        rows.filter(r =>
+          normalizeResultForStats(r.result) === "Loss"
+        ).length;
+
+      const profit =
+        rows.reduce((sum,row)=>sum + profitForRow(row),0);
+
+      const totalStake =
+        rows.reduce((sum,row)=>
+          sum + Number(row.stake || 10),0);
+
+      const roi =
+        totalStake
+          ? Number(((profit / totalStake) * 100).toFixed(1))
+          : 0;
+
+      const winRate =
+        (wins + losses)
+          ? Number(((wins / (wins + losses)) * 100).toFixed(1))
+          : 0;
+
+      return {
+        total:wins + losses,
+        wins,
+        losses,
+        profit:moneyValue(profit),
+        roi,
+        winRate
+      };
+    }
+
+    const teamGroups =
+      byKey(uniqueRows,"team_name");
+
+    const sectionGroups =
+      byKey(allRows,"section");
+
+    const sportGroups =
+      byKey(uniqueRows,"sport");
+
+    const teamStats =
+      Object.keys(teamGroups).map(team=>({
+        team,
+        ...stats(teamGroups[team]),
+        streak:currentStreak(teamGroups[team])
+      }));
+
+    const sectionStats =
+      Object.keys(sectionGroups).map(section=>({
+        section,
+        ...stats(sectionGroups[section]),
+        streak:currentStreak(sectionGroups[section])
+      }));
+
+    const sportStats =
+      Object.keys(sportGroups).map(sport=>({
+        sport,
+        ...stats(sportGroups[sport]),
+        streak:currentStreak(sportGroups[sport])
+      }));
+
+    const hottestTeams =
+      [...teamStats]
+        .filter(t => t.total >= 3)
+        .sort((a,b)=>b.roi - a.roi)
+        .slice(0,5);
+
+    const coldFadeTeams =
+      [...teamStats]
+        .filter(t => t.total >= 3)
+        .sort((a,b)=>a.roi - b.roi)
+        .slice(0,5);
+
+    const hottestSection =
+      [...sectionStats]
+        .sort((a,b)=>b.roi - a.roi)[0] || null;
+
+    const bestSport =
+      [...sportStats]
+        .sort((a,b)=>b.roi - a.roi)[0] || null;
+
+    const mostConsistentSection =
+      [...sectionStats]
+        .sort((a,b)=>b.winRate - a.winRate)[0] || null;
+
+    const currentHeater =
+      [...teamStats]
+        .sort((a,b)=>
+          (b.streak?.count || 0) -
+          (a.streak?.count || 0)
+        )[0] || null;
+
+    const sharpestRecentPicks =
+      [...uniqueRows]
+        .sort((a,b)=>
+          Number(b.confidence || 0) -
+          Number(a.confidence || 0)
+        )
+        .slice(0,10)
+        .map(r=>({
+          pick:r.pick,
+          sport:r.sport,
+          section:r.section,
+          confidence:r.confidence,
+          result:r.result,
+          game:r.game
+        }));
+
+    res.json({
+      success:true,
+      mode:"smartbet_trend_summary_v1",
+
+      generatedAt:new Date().toISOString(),
+
+      hottestTeams,
+
+      coldFadeTeams,
+
+      hottestSection,
+
+      bestSport,
+
+      mostConsistentSection,
+
+      currentHeater,
+
+      sharpestRecentPicks
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success:false,
+      step:"trend_summary_error",
+      error:err.message
+    });
+
+  }
+
 });
 
 app.listen(PORT, () => {
