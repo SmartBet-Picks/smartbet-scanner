@@ -1,14 +1,5 @@
 require("dotenv").config();
-
-let fetchFn = global.fetch;
-
-if (!fetchFn) {
-  try {
-    fetchFn = require("node-fetch");
-  } catch (error) {
-    console.warn("node-fetch is not installed and global fetch is unavailable.");
-  }
-}
+const fetch = require("node-fetch");
 
 const express = require("express");
 const cors = require("cors");
@@ -94,7 +85,9 @@ function getTrapWarning({ odds, impliedProbability, confidence, edge }) {
   if (odds < -220 && confidence < 72) return "Heavy favorite risk";
   if (edge != null && edge < -4) return "Negative edge warning";
   if (odds > 170 && confidence < 70) return "Longshot volatility";
-  if (impliedProbability && impliedProbability > 0.7 && confidence < 75) return "Public favorite caution";
+  if (impliedProbability && impliedProbability > 0.7 && confidence < 75) {
+    return "Public favorite caution";
+  }
   return "None";
 }
 
@@ -158,11 +151,7 @@ function uniqueByGameAndTeam(picks) {
 }
 
 async function fetchJson(url) {
-  if (!fetchFn) {
-    throw new Error("Fetch is unavailable. Use Node 18+ on Railway or add node-fetch to package.json.");
-  }
-
-  const res = await fetchFn(url);
+  const res = await fetch(url);
   const text = await res.text();
 
   if (!res.ok) throw new Error(`Fetch failed ${res.status}: ${text}`);
@@ -196,7 +185,6 @@ app.get("/", (req, res) => {
     stack: "Shopify + Railway + Supabase + Odds API",
     bookmaker: "DraftKings only",
     market: "Moneyline",
-    fetch_ready: !!fetchFn,
     routes: [
       "/",
       "/scan",
@@ -267,7 +255,8 @@ app.get("/scan", async (req, res) => {
             market: "Moneyline",
             bookmaker: "DraftKings",
             odds,
-            implied_probability: impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
+            implied_probability:
+              impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
             confidence,
             edge,
             risk: getRiskLabel(confidence, odds),
@@ -393,8 +382,13 @@ app.get("/grade", async (req, res) => {
         continue;
       }
 
-      const teamScore = scoresArr.find(s => normalizeTeam(s.name) === normalizeTeam(pick.team_name));
-      const opponentScore = scoresArr.find(s => normalizeTeam(s.name) !== normalizeTeam(pick.team_name));
+      const teamScore = scoresArr.find(
+        s => normalizeTeam(s.name) === normalizeTeam(pick.team_name)
+      );
+
+      const opponentScore = scoresArr.find(
+        s => normalizeTeam(s.name) !== normalizeTeam(pick.team_name)
+      );
 
       if (!teamScore || !opponentScore) {
         skipped.push({ id: pick.id, reason: "Team score not matched", game: pick.game });
@@ -527,11 +521,23 @@ app.get("/analytics-summary", async (req, res) => {
       const sport = p.sport || "Unknown";
 
       if (!sectionAnalytics[section]) {
-        sectionAnalytics[section] = { section, wins: 0, losses: 0, total: 0, win_rate: 0 };
+        sectionAnalytics[section] = {
+          section,
+          wins: 0,
+          losses: 0,
+          total: 0,
+          win_rate: 0
+        };
       }
 
       if (!sportAnalytics[sport]) {
-        sportAnalytics[sport] = { sport, wins: 0, losses: 0, total: 0, win_rate: 0 };
+        sportAnalytics[sport] = {
+          sport,
+          wins: 0,
+          losses: 0,
+          total: 0,
+          win_rate: 0
+        };
       }
 
       if (p.result === "Win") {
