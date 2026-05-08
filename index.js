@@ -701,3 +701,220 @@ app.get("/debug-scores", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`SmartBet backend running on port ${PORT}`);
 });
+
+// ===============================
+// SMARTBET CLEAN SCANNER PATCH
+// Paste at very bottom of index.js
+// Keeps NFL enabled but blocks offseason/far-future/futures-style junk
+// ===============================
+
+function smartbetGameWindowHours(sportKey) {
+  if (sportKey === "mma_mixed_martial_arts") return 14 * 24; // UFC can be listed further out
+  if (sportKey === "americanfootball_nfl") return 7 * 24; // NFL only within 7 days
+  return 72; // MLB/NBA within 72 hours
+}
+
+function smartbetIsNFLInPlayableWindow(gameTime) {
+  const month = gameTime.getUTCMonth() + 1;
+
+  // NFL playable months: Aug-Feb only
+  // Blocks offseason spring/summer futures/placeholder markets
+  return [1, 2, 8, 9, 10, 11, 12].includes(month);
+}
+
+function smartbetLooksLikeFuturesMarket(game) {
+  const text = [
+    game?.home_team,
+    game?.away_team,
+    game?.name,
+    game?.description,
+    game?.title
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  const bannedWords = [
+    "super bowl winner",
+    "championship",
+    "conference winner",
+    "division winner",
+    "regular season wins",
+    "to win",
+    "mvp",
+    "rookie of the year",
+    "cy young",
+    "heisman",
+    "draft",
+    "playoffs yes",
+    "playoffs no"
+  ];
+
+  return bannedWords.some(word => text.includes(word));
+}
+
+function smartbetIsValidScannerGame(game, sportKey) {
+  if (!game || !game.commence_time) return false;
+  if (!game.home_team || !game.away_team) return false;
+  if (smartbetLooksLikeFuturesMarket(game)) return false;
+
+  const gameTime = new Date(game.commence_time);
+  if (Number.isNaN(gameTime.getTime())) return false;
+
+  const now = new Date();
+  const minTime = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+  const maxTime = new Date(
+    now.getTime() + smartbetGameWindowHours(sportKey) * 60 * 60 * 1000
+  );
+
+  if (gameTime < minTime) return false;
+  if (gameTime > maxTime) return false;
+
+  if (sportKey === "americanfootball_nfl" && !smartbetIsNFLInPlayableWindow(gameTime)) {
+    return false;
+  }
+
+  return true;
+}
+
+// Remove old /scan route so this clean version takes over
+if (app._router && app._router.stack) {
+  app._router.stack = app._router.stack.filter(layer => {
+    if (!layer.route) return true;
+    return layer.route.path !== "/scan";
+  });
+}
+
+app.get("/scan", async (req, res) => {
+  try {
+    const allPicks = [];
+    const skippedGames = [];
+
+    for (const sport of SPORTS) {
+      const url =
+        `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
+        `?apiKey=${ODDS_API_KEY}` +
+        `&regions=${REGIONS}` +
+        `&markets=${MARKETS}` +
+        `&oddsFormat=${ODDS_FORMAT}` +
+        `&bookmakers=${BOOKMAKER_KEY}`;
+
+      const games = await fetchJson(url);
+
+      for (const game of games || []) {
+        if (!smartbetIsValidScannerGame(game, sport.key)) {
+          skippedGames.push({
+            sport: sport.label,
+            game: `${game?.away_team || "Unknown"} @ ${game?.home_team || "Unknown"}`,
+            commence_time: game?.commence_time || null,
+            reason: "Filtered out: offseason, old, far-future, missing teams, or futures-style market"
+          });
+          continue;
+        }
+
+        const bookmaker = (game.bookmakers || []).find(b => b.key === BOOKMAKER_KEY);
+        if (!bookmaker) continue;
+
+        const market = (bookmaker.markets || []).find(m => m.key === MARKETS);
+        if (!market || !market.outcomes) continue;
+
+        for (const outcome of market.outcomes) {
+          const teamName = outcome.name;
+          const odds = Number(outcome.price);
+
+          if (!teamName || !Number.isFinite(odds)) continue;
+
+          const normalizedTeam = normalizeTeam(teamName);
+          const validTeam =
+            normalizedTeam === normalizeTeam(game.home_team) ||
+            normalizedTeam === normalizeTeam(game.away_team);
+
+          if (!validTeam) continue;
+
+          const impliedRaw = americanToImpliedProbability(odds);
+
+          const confidence = confidenceEngineV2({
+            odds,
+            homeTeam: game.home_team,
+            teamName
+          });
+
+          const edge = calculateEdge(impliedRaw, confidence);
+          const marketConfidence = getMarketConfidence(impliedRaw, odds);
+          const volatility = getVolatility(odds, impliedRaw);
+
+          const trapWarning = getTrapWarning({
+            odds,
+            impliedProbability: impliedRaw,
+            confidence,
+            edge
+          });
+
+          allPicks.push({
+            sport: sport.label,
+            sport_key: sport.key,
+            event_id: game.id || null,
+            game: `${game.away_team} @ ${game.home_team}`,
+            home_team: game.home_team,
+            away_team: game.away_team,
+            team_name: teamName,
+            pick: teamName,
+            market: "Moneyline",
+            bookmaker: "DraftKings",
+            odds,
+            implied_probability:
+              impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
+            confidence,
+            edge,
+            risk: getRiskLabel(confidence, odds),
+            market_confidence: marketConfidence,
+            volatility,
+            trap_warning: trapWarning,
+            commence_time: game.commence_time,
+            game_date: toDateOnly(game.commence_time),
+            status: "Pending",
+            result: "Pending",
+            actual_result: null,
+            graded_at: null,
+            created_at: nowISO(),
+            updated_at: nowISO()
+          });
+        }
+      }
+    }
+
+    const finalPicks = assignSections(uniqueByGameAndTeam(allPicks))
+      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0))
+      .slice(0, 40);
+
+    await supabase.from("picks").delete().neq("id", 0);
+
+    if (finalPicks.length > 0) {
+      const { error } = await supabase.from("picks").insert(finalPicks);
+      if (error) throw error;
+
+      for (const pick of finalPicks) {
+        await insertPickHistoryIfMissing(pick);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Clean scan complete",
+      filter_note:
+        "NFL is still enabled, but offseason, old, far-future, futures-style, and invalid-team markets are blocked.",
+      bookmaker: "DraftKings",
+      market: "Moneyline",
+      total_saved: finalPicks.length,
+      skipped_games_count: skippedGames.length,
+      top_5_count: finalPicks.filter(p => p.section === "Top 5 Locks").length,
+      free_pick_count: finalPicks.filter(p => p.section === "Free Pick").length,
+      time: nowISO(),
+      picks: finalPicks,
+      skipped_games: skippedGames.slice(0, 25)
+    });
+  } catch (error) {
+    console.error("CLEAN SCAN ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
