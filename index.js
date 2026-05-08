@@ -1,967 +1,701 @@
-import express from "express";
-import fetch from "node-fetch";
-import { createClient } from "@supabase/supabase-js";
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+app.use(cors());
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
-
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, apikey");
-
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
 
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const REGION = process.env.REGION || "us";
-const BOOKMAKER = process.env.BOOKMAKER || "draftkings";
-const BET_LINK = "https://sportsbook.draftkings.com/";
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  db: { schema: "public" }
-});
+if (!ODDS_API_KEY) console.warn("Missing ODDS_API_KEY");
+if (!SUPABASE_URL) console.warn("Missing SUPABASE_URL");
+if (!SUPABASE_SERVICE_ROLE_KEY) console.warn("Missing SUPABASE_SERVICE_ROLE_KEY");
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+const BOOKMAKER_KEY = "draftkings";
+const REGIONS = "us";
+const MARKETS = "h2h";
+const ODDS_FORMAT = "american";
 
 const SPORTS = [
-  "basketball_nba",
-  "baseball_mlb",
-  "americanfootball_nfl",
-  "mma_mixed_martial_arts"
+  { key: "baseball_mlb", label: "MLB" },
+  { key: "basketball_nba", label: "NBA" },
+  { key: "americanfootball_nfl", label: "NFL" },
+  { key: "mma_mixed_martial_arts", label: "UFC" }
 ];
 
-function calcProfit(odds, stake = 10) {
-  if (odds > 0) return +(stake * (odds / 100)).toFixed(2);
-  return +(stake * (100 / Math.abs(odds))).toFixed(2);
+const SECTIONS = ["Top 5 Locks", "Safe Slip", "Balanced Slip", "Aggressive Slip", "Free Pick"];
+
+function nowISO() {
+  return new Date().toISOString();
 }
 
-function calculateConfidenceEngineV2(pick) {
-  const odds = Number(pick.odds || 0);
-  const section = String(pick.section || "");
-
-  let score = 50;
-  let impliedProb = 0;
-
-  if (odds < 0) {
-    impliedProb = Math.abs(odds) / (Math.abs(odds) + 100);
-  } else {
-    impliedProb = 100 / (odds + 100);
-  }
-
-  impliedProb *= 100;
-
-  if (odds <= -180) score += 18;
-  else if (odds <= -150) score += 14;
-  else if (odds <= -130) score += 10;
-  else if (odds <= -115) score += 7;
-
-  if (odds <= -260) score -= 8;
-  if (odds <= -350) score -= 12;
-
-  if (odds >= 110 && odds <= 165) score += 7;
-  if (odds >= 220) score -= 15;
-
-  if (impliedProb >= 65) score += 12;
-  else if (impliedProb >= 58) score += 8;
-  else if (impliedProb >= 54) score += 5;
-
-  if (section === "Top 5 Locks") score += 6;
-  if (section === "Safe Slip") score += 5;
-  if (section === "Balanced Slip") score += 3;
-
-  if (score > 99) score = 99;
-  if (score < 1) score = 1;
-
-  let risk = "Medium Risk";
-  if (score >= 88) risk = "Low Risk";
-  else if (score >= 75) risk = "Balanced";
-  else if (score >= 60) risk = "Medium Risk";
-  else risk = "High Risk";
-
-  let edge = "Standard";
-  if (score >= 90) edge = "Sharp Premium";
-  else if (score >= 82) edge = "Strong Edge";
-  else if (score >= 72) edge = "Positive Edge";
-  else if (score < 60) edge = "Volatile";
-
-  return {
-    confidence: Math.round(score),
-    score: Math.round(score),
-    implied_probability: Number(impliedProb.toFixed(1)),
-    edge,
-    risk
-  };
+function toDateOnly(value) {
+  if (!value) return null;
+  return new Date(value).toISOString().slice(0, 10);
 }
 
-function applyEngineToPick(pick) {
-  const engine = calculateConfidenceEngineV2(pick);
-
-  return {
-    ...pick,
-    confidence: engine.confidence,
-    score: engine.score,
-    risk: engine.risk,
-    edge: engine.edge,
-    implied_probability: engine.implied_probability
-  };
-}
-
-function buildReason(pick) {
-  const edge = pick.edge || "Positive Edge";
-  const implied = pick.implied_probability ? `${pick.implied_probability}% implied probability` : "a playable implied probability";
-
-  return `${pick.pick} grades as a ${edge} moneyline play with ${implied}, a SmartBet confidence score of ${pick.confidence}, and a ${pick.risk} profile.`;
-}
-
-function isSameDay(eventTime) {
-  if (!eventTime) return false;
-
-  const eventDate = new Date(eventTime);
-  const today = new Date();
-
-  return (
-    eventDate.getFullYear() === today.getFullYear() &&
-    eventDate.getMonth() === today.getMonth() &&
-    eventDate.getDate() === today.getDate()
-  );
-}
-
-function sameGameDate(timeA, timeB) {
-  if (!timeA || !timeB) return false;
-
-  const a = new Date(timeA);
-  const b = new Date(timeB);
-
-  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return false;
-
-  return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
-  );
-}
-
-function closeGameTime(timeA, timeB) {
-  if (!timeA || !timeB) return false;
-
-  const a = new Date(timeA).getTime();
-  const b = new Date(timeB).getTime();
-
-  if (Number.isNaN(a) || Number.isNaN(b)) return false;
-
-  return Math.abs(a - b) / (1000 * 60 * 60) <= 12;
-}
-
-function removeDuplicateGames(picks) {
-  const seenGames = new Set();
-
-  return picks.filter(pick => {
-    if (seenGames.has(pick.game)) return false;
-    seenGames.add(pick.game);
-    return true;
-  });
-}
-
-function buildSections(picks) {
-  const sorted = [...picks]
-    .filter(p => p.score >= 70)
-    .sort((a, b) => b.score - a.score);
-
-  const clean = removeDuplicateGames(sorted);
-
-  return [
-    ...clean.slice(0, 1).map(p => ({ ...p, section: "Free Pick" })),
-    ...clean.slice(0, 5).map(p => ({ ...p, section: "Top 5 Locks" })),
-    ...clean.filter(p => p.score >= 85).slice(0, 3).map(p => ({ ...p, section: "Safe Slip" })),
-    ...clean.filter(p => p.score >= 75).slice(0, 5).map(p => ({ ...p, section: "Balanced Slip" })),
-    ...clean.filter(p => p.score >= 70).slice(0, 6).map(p => ({ ...p, section: "Aggressive Slip" }))
-  ];
-}
-
-function makeScanId() {
-  return `scan_${new Date().toISOString()}`;
-}
-
-function getTeamNameFromPick(pickText) {
-  return String(pickText || "").replace(" Moneyline", "").trim();
-}
-
-function cleanForDatabase(pick) {
-  return {
-    sport: pick.sport,
-    game: pick.game,
-    commence_time: pick.commence_time,
-    market: pick.market,
-    pick: pick.pick,
-    team_name: pick.team_name,
-    odds: pick.odds,
-    confidence: pick.confidence,
-    score: pick.score,
-    implied_probability: pick.implied_probability,
-    edge: pick.edge,
-    risk: pick.risk,
-    reason: pick.reason,
-    book: pick.book,
-    stake: pick.stake,
-    profit: pick.profit,
-    payout: pick.payout,
-    bet_link: pick.bet_link,
-    section: pick.section
-  };
-}
-
-function normalizeText(text = "") {
-  return String(text)
+function normalizeTeam(name) {
+  return String(name || "")
     .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/[^a-z0-9 ]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function gamesMatch(pickGame, homeTeam, awayTeam) {
-  const pg = normalizeText(pickGame);
-  const home = normalizeText(homeTeam);
-  const away = normalizeText(awayTeam);
-
-  return pg.includes(home) && pg.includes(away);
+function americanToImpliedProbability(odds) {
+  const n = Number(odds);
+  if (!Number.isFinite(n) || n === 0) return null;
+  if (n < 0) return Math.abs(n) / (Math.abs(n) + 100);
+  return 100 / (n + 100);
 }
 
-function exactGameMatch(pick, scoreGame) {
-  if (!pick || !scoreGame) return false;
-
-  return (
-    pick.sport === scoreGame.sport &&
-    gamesMatch(pick.game, scoreGame.home_team, scoreGame.away_team) &&
-    sameGameDate(pick.commence_time, scoreGame.commence_time) &&
-    closeGameTime(pick.commence_time, scoreGame.commence_time)
-  );
+function calculateEdge(impliedProbability, confidence) {
+  if (impliedProbability == null || confidence == null) return null;
+  const modelProbability = Number(confidence) / 100;
+  return Number(((modelProbability - impliedProbability) * 100).toFixed(2));
 }
 
-function pickContainsTeam(pickText, teamName) {
-  return normalizeText(pickText).includes(normalizeText(teamName));
+function getRiskLabel(confidence, odds) {
+  if (confidence >= 78 && odds <= 120) return "Low";
+  if (confidence >= 68) return "Medium";
+  return "High";
 }
 
-function getWinnerFromScoreGame(game) {
-  if (!game || !game.completed || !Array.isArray(game.scores)) return null;
-
-  const home = game.scores.find(s => normalizeText(s.name) === normalizeText(game.home_team));
-  const away = game.scores.find(s => normalizeText(s.name) === normalizeText(game.away_team));
-
-  if (!home || !away) return null;
-
-  const homeScore = Number(home.score);
-  const awayScore = Number(away.score);
-
-  if (Number.isNaN(homeScore) || Number.isNaN(awayScore)) return null;
-
-  if (homeScore > awayScore) return game.home_team;
-  if (awayScore > homeScore) return game.away_team;
-
-  return null;
+function getMarketConfidence(impliedProbability, odds) {
+  if (impliedProbability == null) return "Unknown";
+  if (impliedProbability >= 0.62 && odds < 0) return "Strong Market";
+  if (impliedProbability >= 0.52) return "Balanced Market";
+  if (odds > 130) return "Underdog Market";
+  return "Volatile Market";
 }
 
-function normalizeResultForStats(result) {
-  const r = String(result || "").toLowerCase();
-
-  if (r.includes("win")) return "Win";
-  if (r.includes("loss") || r.includes("lose")) return "Loss";
-
-  return "Pending";
+function getVolatility(odds, impliedProbability) {
+  if (odds >= 180) return "High";
+  if (odds >= 120) return "Medium-High";
+  if (impliedProbability && impliedProbability >= 0.62) return "Low";
+  return "Medium";
 }
 
-function moneyValue(num) {
-  return Number(Number(num || 0).toFixed(2));
+function getTrapWarning({ odds, impliedProbability, confidence, edge }) {
+  if (odds < -220 && confidence < 72) return "Heavy favorite risk";
+  if (edge != null && edge < -4) return "Negative edge warning";
+  if (odds > 170 && confidence < 70) return "Longshot volatility";
+  if (impliedProbability && impliedProbability > 0.7 && confidence < 75) return "Public favorite caution";
+  return "None";
 }
 
-function profitForRow(row) {
-  const result = normalizeResultForStats(row.result);
+function confidenceEngineV2({ odds, homeTeam, awayTeam, teamName }) {
+  const implied = americanToImpliedProbability(odds);
+  let confidence = 60;
 
-  if (result === "Win") return Number(row.profit || 0);
-  if (result === "Loss") return -Number(row.stake || 10);
-
-  return 0;
-}
-
-function roiForRows(rows) {
-  const graded = rows.filter(r => ["Win", "Loss"].includes(normalizeResultForStats(r.result)));
-
-  const wins = graded.filter(r => normalizeResultForStats(r.result) === "Win").length;
-  const losses = graded.filter(r => normalizeResultForStats(r.result) === "Loss").length;
-
-  const totalStake = graded.reduce((sum, r) => sum + Number(r.stake || 10), 0);
-  const profit = graded.reduce((sum, r) => sum + profitForRow(r), 0);
-
-  return {
-    total: graded.length,
-    wins,
-    losses,
-    profit: moneyValue(profit),
-    totalStake: moneyValue(totalStake),
-    roi: totalStake ? Number(((profit / totalStake) * 100).toFixed(1)) : 0,
-    winRate: graded.length ? Number(((wins / graded.length) * 100).toFixed(1)) : 0
-  };
-}
-
-function groupBy(rows, key) {
-  return rows.reduce((acc, row) => {
-    const value = row[key] || "Unknown";
-    if (!acc[value]) acc[value] = [];
-    acc[value].push(row);
-    return acc;
-  }, {});
-}
-
-function currentStreak(rows) {
-  const sorted = [...rows]
-    .filter(r => ["Win", "Loss"].includes(normalizeResultForStats(r.result)))
-    .sort((a, b) => new Date(b.graded_at || b.inserted_at) - new Date(a.graded_at || a.inserted_at));
-
-  if (!sorted.length) return { type: "None", count: 0 };
-
-  const first = normalizeResultForStats(sorted[0].result);
-  let count = 0;
-
-  for (const row of sorted) {
-    if (normalizeResultForStats(row.result) === first) count++;
-    else break;
+  if (implied != null) {
+    confidence += Math.min(18, implied * 20);
   }
 
-  return { type: first, count };
+  if (odds < 0) confidence += 5;
+  if (odds <= -160) confidence += 3;
+  if (odds >= 120) confidence -= 3;
+  if (odds >= 180) confidence -= 6;
+
+  const isHome = normalizeTeam(teamName) === normalizeTeam(homeTeam);
+  if (isHome) confidence += 3;
+
+  confidence = Math.max(45, Math.min(92, confidence));
+  return Number(confidence.toFixed(1));
 }
 
-function uniquePickRows(rows) {
-  const seen = new Set();
+function assignSections(picks) {
+  const sorted = [...picks].sort((a, b) => {
+    const c = Number(b.confidence || 0) - Number(a.confidence || 0);
+    if (c !== 0) return c;
+    return Number(b.edge || 0) - Number(a.edge || 0);
+  });
 
-  return rows.filter(row => {
-    const key = `${row.sport}|${row.game}|${row.pick}|${row.commence_time || row.inserted_at}`;
+  return sorted.map((pick, index) => {
+    let section = "Aggressive Slip";
 
-    if (seen.has(key)) return false;
+    if (index < 5) section = "Top 5 Locks";
+    else if (pick.confidence >= 76 && pick.volatility === "Low") section = "Safe Slip";
+    else if (pick.confidence >= 68) section = "Balanced Slip";
 
-    seen.add(key);
-    return true;
+    if (index === 0) section = "Free Pick";
+
+    return { ...pick, section };
   });
 }
 
+function uniqueByGameAndTeam(picks) {
+  const seen = new Set();
+  const out = [];
+
+  for (const p of picks) {
+    const key = [
+      p.sport,
+      toDateOnly(p.commence_time),
+      normalizeTeam(p.home_team),
+      normalizeTeam(p.away_team),
+      normalizeTeam(p.team_name)
+    ].join("|");
+
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(p);
+    }
+  }
+
+  return out;
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url);
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`Fetch failed ${res.status}: ${text}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid JSON: ${text}`);
+  }
+}
+
+async function insertPickHistoryIfMissing(pick) {
+  const { data: existing } = await supabase
+    .from("pick_history")
+    .select("id")
+    .eq("sport", pick.sport)
+    .eq("team_name", pick.team_name)
+    .eq("home_team", pick.home_team)
+    .eq("away_team", pick.away_team)
+    .eq("commence_time", pick.commence_time)
+    .limit(1);
+
+  if (existing && existing.length > 0) return;
+
+  await supabase.from("pick_history").insert([pick]);
+}
+
 app.get("/", (req, res) => {
-  res.send("SmartBet scanner with Confidence Engine V2 live");
+  res.json({
+    status: "SmartBet Railway backend running",
+    stack: "Shopify + Railway + Supabase + Odds API",
+    bookmaker: "DraftKings only",
+    market: "Moneyline",
+    routes: [
+      "/",
+      "/scan",
+      "/grade",
+      "/results-summary",
+      "/analytics-summary",
+      "/trend-summary",
+      "/debug-scores",
+      "/debug-pending"
+    ],
+    time: nowISO()
+  });
 });
 
 app.get("/scan", async (req, res) => {
   try {
-    const scanId = makeScanId();
-    let rawPicks = [];
+    const allPicks = [];
 
     for (const sport of SPORTS) {
       const url =
-        `https://api.the-odds-api.com/v4/sports/${sport}/odds/` +
+        `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
         `?apiKey=${ODDS_API_KEY}` +
-        `&regions=${REGION}` +
-        `&bookmakers=${BOOKMAKER}` +
-        `&markets=h2h` +
-        `&oddsFormat=american`;
+        `&regions=${REGIONS}` +
+        `&markets=${MARKETS}` +
+        `&oddsFormat=${ODDS_FORMAT}` +
+        `&bookmakers=${BOOKMAKER_KEY}`;
 
-      const response = await fetch(url);
-      const data = await response.json();
+      const games = await fetchJson(url);
 
-      if (!Array.isArray(data)) continue;
+      for (const game of games || []) {
+        const commenceTime = game.commence_time;
+        const gameDate = toDateOnly(commenceTime);
+        const bookmaker = (game.bookmakers || []).find(b => b.key === BOOKMAKER_KEY);
+        if (!bookmaker) continue;
 
-      for (const game of data) {
-        if (!game.bookmakers) continue;
+        const market = (bookmaker.markets || []).find(m => m.key === MARKETS);
+        if (!market || !market.outcomes) continue;
 
-        const gameName = `${game.away_team} @ ${game.home_team}`;
+        for (const outcome of market.outcomes) {
+          const teamName = outcome.name;
+          const odds = Number(outcome.price);
+          if (!teamName || !Number.isFinite(odds)) continue;
 
-        for (const book of game.bookmakers) {
-          if (!book.markets) continue;
+          const impliedProbability = americanToImpliedProbability(odds);
+          const confidence = confidenceEngineV2({
+            odds,
+            homeTeam: game.home_team,
+            awayTeam: game.away_team,
+            teamName
+          });
 
-          for (const market of book.markets) {
-            if (market.key !== "h2h") continue;
+          const edge = calculateEdge(impliedProbability, confidence);
+          const marketConfidence = getMarketConfidence(impliedProbability, odds);
+          const volatility = getVolatility(odds, impliedProbability);
+          const trapWarning = getTrapWarning({
+            odds,
+            impliedProbability,
+            confidence,
+            edge
+          });
 
-            for (const outcome of market.outcomes || []) {
-              const odds = Number(outcome.price);
+          const pick = {
+            sport: sport.label,
+            sport_key: sport.key,
+            event_id: game.id || null,
+            game: `${game.away_team} @ ${game.home_team}`,
+            home_team: game.home_team,
+            away_team: game.away_team,
+            team_name: teamName,
+            pick: teamName,
+            market: "Moneyline",
+            bookmaker: "DraftKings",
+            odds,
+            implied_probability:
+              impliedProbability == null ? null : Number((impliedProbability * 100).toFixed(2)),
+            confidence,
+            edge,
+            risk: getRiskLabel(confidence, odds),
+            market_confidence: marketConfidence,
+            volatility,
+            trap_warning: trapWarning,
+            commence_time: commenceTime,
+            game_date: gameDate,
+            status: "Pending",
+            result: "Pending",
+            actual_result: null,
+            graded_at: null,
+            created_at: nowISO(),
+            updated_at: nowISO()
+          };
 
-              if (!odds || odds < -350 || odds > 220) continue;
-
-              const stake = 10;
-              const profit = calcProfit(odds, stake);
-              const payout = +(stake + profit).toFixed(2);
-              const pickName = `${outcome.name} Moneyline`;
-
-              let pick = {
-                sport,
-                game: gameName,
-                commence_time: game.commence_time,
-                market: "moneyline",
-                pick: pickName,
-                team_name: outcome.name,
-                odds,
-                book: book.key || BOOKMAKER,
-                stake,
-                profit,
-                payout,
-                bet_link: BET_LINK
-              };
-
-              pick = applyEngineToPick(pick);
-
-              if (pick.score < 70) continue;
-
-              pick.reason = buildReason(pick);
-
-              rawPicks.push(pick);
-            }
-          }
+          allPicks.push(pick);
         }
       }
     }
 
-    let usablePicks = rawPicks.filter(p => isSameDay(p.commence_time));
-    const usingFallback = usablePicks.length === 0;
+    const uniquePicks = uniqueByGameAndTeam(allPicks);
+    const finalPicks = assignSections(uniquePicks)
+      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0))
+      .slice(0, 40);
 
-    if (usingFallback) usablePicks = rawPicks;
+    await supabase.from("picks").delete().neq("id", 0);
 
-    const sectionedPicks = buildSections(usablePicks).map(p => {
-      const updated = applyEngineToPick(p);
-      updated.reason = buildReason(updated);
-      return updated;
-    });
+    if (finalPicks.length > 0) {
+      const { error } = await supabase.from("picks").insert(finalPicks);
+      if (error) throw error;
 
-    const finalPicks = sectionedPicks.map(cleanForDatabase);
-
-    const historyRows = finalPicks.map(p => ({
-      ...p,
-      scan_id: scanId,
-      result: "Pending",
-      actual_result: null,
-      graded_at: null
-    }));
-
-    if (historyRows.length > 0) {
-      const { error: historyError } = await supabase
-        .from("pick_history")
-        .insert(historyRows);
-
-      if (historyError) {
-        return res.status(500).json({
-          success: false,
-          step: "insert_pick_history",
-          error: historyError.message,
-          sample_pick: historyRows[0]
-        });
+      for (const pick of finalPicks) {
+        await insertPickHistoryIfMissing(pick);
       }
-    }
-
-    const { error: deleteError } = await supabase
-      .from("picks")
-      .delete()
-      .neq("id", 0);
-
-    if (deleteError) {
-      return res.status(500).json({
-        success: false,
-        step: "delete_old_live_picks",
-        error: deleteError.message
-      });
-    }
-
-    const { data: insertedRows, error: insertError } = await supabase
-      .from("picks")
-      .insert(finalPicks)
-      .select();
-
-    if (insertError) {
-      return res.status(500).json({
-        success: false,
-        step: "insert_live_picks",
-        error: insertError.message,
-        sample_pick: finalPicks[0]
-      });
     }
 
     res.json({
       success: true,
-      mode: "confidence_engine_v2_scan",
-      scan_id: scanId,
-      raw_picks_found: rawPicks.length,
-      same_day_picks_found: rawPicks.filter(p => isSameDay(p.commence_time)).length,
-      fallback_used: usingFallback,
-      inserted_live: insertedRows ? insertedRows.length : 0,
-      inserted_history: historyRows.length,
-      sections: {
-        free_pick: finalPicks.filter(p => p.section === "Free Pick").length,
-        top_5_locks: finalPicks.filter(p => p.section === "Top 5 Locks").length,
-        safe_slip: finalPicks.filter(p => p.section === "Safe Slip").length,
-        balanced_slip: finalPicks.filter(p => p.section === "Balanced Slip").length,
-        aggressive_slip: finalPicks.filter(p => p.section === "Aggressive Slip").length
-      },
-      confidence_engine: {
-        version: "v2",
-        features: [
-          "implied probability",
-          "favorite zone scoring",
-          "trap favorite penalty",
-          "underdog value boost",
-          "section weighting",
-          "edge labeling",
-          "risk normalization"
-        ]
-      }
+      message: "Scan complete",
+      bookmaker: "DraftKings",
+      market: "Moneyline",
+      total_saved: finalPicks.length,
+      top_5_count: finalPicks.filter(p => p.section === "Top 5 Locks").length,
+      free_pick_count: finalPicks.filter(p => p.section === "Free Pick").length,
+      time: nowISO(),
+      picks: finalPicks
     });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      step: "main_error",
-      error: err.message
-    });
+  } catch (error) {
+    console.error("SCAN ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get("/grade", async (req, res) => {
   try {
-    const { data: pendingPicks, error: fetchError } = await supabase
+    const { data: pending, error } = await supabase
       .from("pick_history")
       .select("*")
-      .eq("result", "Pending")
-      .eq("market", "moneyline")
+      .or("status.eq.Pending,result.eq.Pending")
       .not("commence_time", "is", null);
 
-    if (fetchError) {
-      return res.status(500).json({
-        success: false,
-        step: "fetch_pending_moneyline_picks",
-        error: fetchError.message
-      });
-    }
+    if (error) throw error;
 
-    if (!pendingPicks || pendingPicks.length === 0) {
-      return res.json({
-        success: true,
-        mode: "exact_game_date_grading",
-        message: "No pending moneyline picks with commence_time to grade.",
-        graded: 0
-      });
-    }
+    const now = new Date();
+    const graded = [];
+    const skipped = [];
 
-    let allScoreGames = [];
+    for (const pick of pending || []) {
+      const commence = new Date(pick.commence_time);
 
-    for (const sport of SPORTS) {
-      const scoreUrl =
-        `https://api.the-odds-api.com/v4/sports/${sport}/scores/` +
+      if (commence > now) {
+        skipped.push({
+          id: pick.id,
+          reason: "Future game - not graded early",
+          game: pick.game,
+          commence_time: pick.commence_time
+        });
+        continue;
+      }
+
+      const sportConfig = SPORTS.find(s => s.label === pick.sport || s.key === pick.sport_key);
+      if (!sportConfig) {
+        skipped.push({ id: pick.id, reason: "Unknown sport", game: pick.game });
+        continue;
+      }
+
+      const url =
+        `https://api.the-odds-api.com/v4/sports/${sportConfig.key}/scores` +
         `?apiKey=${ODDS_API_KEY}` +
         `&daysFrom=3`;
 
-      const scoreResponse = await fetch(scoreUrl);
-      const scoreData = await scoreResponse.json();
+      const scores = await fetchJson(url);
+      const pickDate = toDateOnly(pick.commence_time);
 
-      if (Array.isArray(scoreData)) {
-        allScoreGames.push(...scoreData.map(g => ({ ...g, sport })));
-      }
-    }
-
-    let graded = 0;
-    let wins = 0;
-    let losses = 0;
-    let skipped = 0;
-    let unmatched = 0;
-    let matchedButNotComplete = 0;
-    let noWinnerFound = 0;
-    let updateErrors = [];
-    let debugMatchedSamples = [];
-    let pendingFutureGames = 0;
-
-    for (const pick of pendingPicks) {
-      const matchedGame = allScoreGames.find(g => exactGameMatch(pick, g));
-
-      if (!matchedGame) {
-        skipped++;
-        unmatched++;
-        continue;
-      }
-
-      if (!matchedGame.completed) {
-        skipped++;
-        matchedButNotComplete++;
-        pendingFutureGames++;
-        continue;
-      }
-
-      const winningTeam = getWinnerFromScoreGame(matchedGame);
-
-      debugMatchedSamples.push({
-        pick_id: pick.id,
-        pick: pick.pick,
-        pick_game: pick.game,
-        pick_commence_time: pick.commence_time,
-        matched_home: matchedGame.home_team,
-        matched_away: matchedGame.away_team,
-        matched_commence_time: matchedGame.commence_time,
-        completed: matchedGame.completed,
-        scores: matchedGame.scores,
-        winning_team: winningTeam
+      const match = (scores || []).find(game => {
+        const scoreDate = toDateOnly(game.commence_time);
+        const sameDate = scoreDate === pickDate;
+        const sameHome = normalizeTeam(game.home_team) === normalizeTeam(pick.home_team);
+        const sameAway = normalizeTeam(game.away_team) === normalizeTeam(pick.away_team);
+        return sameDate && sameHome && sameAway;
       });
 
-      if (!winningTeam) {
-        skipped++;
-        noWinnerFound++;
+      if (!match) {
+        skipped.push({
+          id: pick.id,
+          reason: "No exact game-date match found",
+          game: pick.game,
+          commence_time: pick.commence_time
+        });
         continue;
       }
 
-      const result = pickContainsTeam(pick.pick, winningTeam) ? "Win" : "Loss";
+      if (!match.completed) {
+        skipped.push({
+          id: pick.id,
+          reason: "Game not completed",
+          game: pick.game,
+          commence_time: pick.commence_time
+        });
+        continue;
+      }
 
-      const { data: updatedRows, error: updateError } = await supabase
+      const scoresArr = match.scores || [];
+      if (scoresArr.length < 2) {
+        skipped.push({ id: pick.id, reason: "Scores missing", game: pick.game });
+        continue;
+      }
+
+      const teamScore = scoresArr.find(s => normalizeTeam(s.name) === normalizeTeam(pick.team_name));
+      const opponentScore = scoresArr.find(s => normalizeTeam(s.name) !== normalizeTeam(pick.team_name));
+
+      if (!teamScore || !opponentScore) {
+        skipped.push({ id: pick.id, reason: "Team score not matched", game: pick.game });
+        continue;
+      }
+
+      const teamPoints = Number(teamScore.score);
+      const oppPoints = Number(opponentScore.score);
+
+      if (!Number.isFinite(teamPoints) || !Number.isFinite(oppPoints)) {
+        skipped.push({ id: pick.id, reason: "Invalid score values", game: pick.game });
+        continue;
+      }
+
+      const won = teamPoints > oppPoints;
+      const actualResult = `${teamScore.name} ${teamPoints} - ${opponentScore.name} ${oppPoints}`;
+
+      const updatePayload = {
+        status: won ? "Win" : "Loss",
+        result: won ? "Win" : "Loss",
+        actual_result: actualResult,
+        graded_at: nowISO(),
+        updated_at: nowISO()
+      };
+
+      const { error: updateError } = await supabase
         .from("pick_history")
-        .update({
-          result,
-          actual_result: `${winningTeam} won`,
-          graded_at: new Date().toISOString()
-        })
-        .eq("id", pick.id)
-        .eq("result", "Pending")
-        .select();
+        .update(updatePayload)
+        .eq("id", pick.id);
 
-      if (updateError) {
-        skipped++;
-        updateErrors.push({
-          pick_id: pick.id,
-          pick: pick.pick,
-          error: updateError.message
-        });
-        continue;
-      }
+      if (updateError) throw updateError;
 
-      if (!updatedRows || updatedRows.length === 0) {
-        skipped++;
-        updateErrors.push({
-          pick_id: pick.id,
-          pick: pick.pick,
-          error: "No rows updated"
-        });
-        continue;
-      }
+      await supabase
+        .from("picks")
+        .update(updatePayload)
+        .eq("team_name", pick.team_name)
+        .eq("home_team", pick.home_team)
+        .eq("away_team", pick.away_team)
+        .eq("commence_time", pick.commence_time);
 
-      graded++;
-      if (result === "Win") wins++;
-      if (result === "Loss") losses++;
+      graded.push({
+        id: pick.id,
+        game: pick.game,
+        pick: pick.team_name,
+        result: won ? "Win" : "Loss",
+        actual_result: actualResult
+      });
     }
 
     res.json({
       success: true,
-      mode: "exact_game_date_grading",
-      pending_checked: pendingPicks.length,
-      score_games_found: allScoreGames.length,
+      message: "Grading complete",
+      graded_count: graded.length,
+      skipped_count: skipped.length,
       graded,
-      wins,
-      losses,
       skipped,
-      unmatched,
-      matched_but_not_complete: matchedButNotComplete,
-      pending_future_games: pendingFutureGames,
-      no_winner_found: noWinnerFound,
-      update_errors: updateErrors.slice(0, 10),
-      debug_matched_samples: debugMatchedSamples.slice(0, 5),
-      note: "Only completed moneyline games are graded when sport, teams, game date, and game time match."
+      time: nowISO()
     });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      step: "exact_grade_error",
-      error: err.message
-    });
+  } catch (error) {
+    console.error("GRADE ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get("/results-summary", async (req, res) => {
   try {
-    const { data: rows, error } = await supabase
+    const { data, error } = await supabase
       .from("pick_history")
       .select("*")
-      .in("result", ["Win", "Loss"]);
+      .in("result", ["Win", "Loss"])
+      .order("graded_at", { ascending: false })
+      .limit(300);
 
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        step: "results_summary_fetch",
-        error: error.message
-      });
+    if (error) throw error;
+
+    const unique = [];
+    const seen = new Set();
+
+    for (const p of data || []) {
+      const key = [
+        p.sport,
+        p.game_date || toDateOnly(p.commence_time),
+        normalizeTeam(p.home_team),
+        normalizeTeam(p.away_team),
+        normalizeTeam(p.team_name)
+      ].join("|");
+
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(p);
+      }
     }
 
-    const stats = roiForRows(Array.isArray(rows) ? rows : []);
+    const wins = unique.filter(p => p.result === "Win").length;
+    const losses = unique.filter(p => p.result === "Loss").length;
+    const total = wins + losses;
+    const winRate = total ? Number(((wins / total) * 100).toFixed(1)) : 0;
 
     res.json({
       success: true,
-      totalGraded: stats.total,
-      wins: stats.wins,
-      losses: stats.losses,
-      winRate: stats.winRate,
-      profit: stats.profit,
-      roi: stats.roi,
-      totalStake: stats.totalStake,
-      lastUpdated: new Date().toISOString()
+      total,
+      wins,
+      losses,
+      win_rate: winRate,
+      recent_results: unique.slice(0, 25),
+      last_updated: nowISO()
     });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      step: "results_summary_error",
-      error: err.message
-    });
+  } catch (error) {
+    console.error("RESULTS SUMMARY ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get("/analytics-summary", async (req, res) => {
   try {
-    const { data: rows, error } = await supabase
+    const { data, error } = await supabase
       .from("pick_history")
       .select("*")
       .in("result", ["Win", "Loss"])
-      .order("graded_at", { ascending: false });
+      .order("graded_at", { ascending: false })
+      .limit(500);
 
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        step: "analytics_fetch",
-        error: error.message
-      });
+    if (error) throw error;
+
+    const sectionAnalytics = {};
+    const sportAnalytics = {};
+
+    for (const p of data || []) {
+      const section = p.section || "Unassigned";
+      const sport = p.sport || "Unknown";
+
+      if (!sectionAnalytics[section]) {
+        sectionAnalytics[section] = { section, wins: 0, losses: 0, total: 0, win_rate: 0 };
+      }
+
+      if (!sportAnalytics[sport]) {
+        sportAnalytics[sport] = { sport, wins: 0, losses: 0, total: 0, win_rate: 0 };
+      }
+
+      if (p.result === "Win") {
+        sectionAnalytics[section].wins++;
+        sportAnalytics[sport].wins++;
+      }
+
+      if (p.result === "Loss") {
+        sectionAnalytics[section].losses++;
+        sportAnalytics[sport].losses++;
+      }
+
+      sectionAnalytics[section].total++;
+      sportAnalytics[sport].total++;
     }
 
-    const allRows = Array.isArray(rows) ? rows : [];
-    const uniqueRows = uniquePickRows(allRows);
+    for (const key of Object.keys(sectionAnalytics)) {
+      const x = sectionAnalytics[key];
+      x.win_rate = x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
+    }
 
-    const now = new Date();
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-
-    const rows7 = uniqueRows.filter(r => new Date(r.graded_at || r.inserted_at) >= sevenDaysAgo);
-    const rows30 = uniqueRows.filter(r => new Date(r.graded_at || r.inserted_at) >= thirtyDaysAgo);
-
-    const sectionGroups = groupBy(allRows, "section");
-    const sportGroups = groupBy(uniqueRows, "sport");
-
-    const sectionStats = Object.keys(sectionGroups).map(section => ({
-      section,
-      ...roiForRows(sectionGroups[section]),
-      streak: currentStreak(sectionGroups[section])
-    })).sort((a, b) => b.roi - a.roi);
-
-    const sportStats = Object.keys(sportGroups).map(sport => ({
-      sport,
-      ...roiForRows(sportGroups[sport]),
-      streak: currentStreak(sportGroups[sport])
-    })).sort((a, b) => b.roi - a.roi);
+    for (const key of Object.keys(sportAnalytics)) {
+      const x = sportAnalytics[key];
+      x.win_rate = x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
+    }
 
     res.json({
       success: true,
-      mode: "smartbet_analytics_summary_v1",
-      generatedAt: new Date().toISOString(),
-      allTrackedRows: allRows.length,
-      uniquePublicResults: uniqueRows.length,
-      overall: roiForRows(uniqueRows),
-      rolling: {
-        sevenDay: roiForRows(rows7),
-        thirtyDay: roiForRows(rows30)
-      },
-      sections: sectionStats,
-      sports: sportStats,
-      highlights: {
-        bestSection: sectionStats[0] || null,
-        bestSport: sportStats[0] || null,
-        worstSport: sportStats.length ? sportStats[sportStats.length - 1] : null,
-        currentOverallStreak: currentStreak(uniqueRows)
-      },
-      recentUniqueResults: uniqueRows.slice(0, 20).map(r => ({
-        id: r.id,
-        sport: r.sport,
-        section: r.section,
-        pick: r.pick,
-        team_name: r.team_name,
-        game: r.game,
-        result: r.result,
-        actual_result: r.actual_result,
-        odds: r.odds,
-        confidence: r.confidence,
-        implied_probability: r.implied_probability,
-        edge: r.edge,
-        risk: r.risk,
-        profit: profitForRow(r),
-        graded_at: r.graded_at
-      }))
+      section_analytics: Object.values(sectionAnalytics),
+      sport_analytics: Object.values(sportAnalytics),
+      last_updated: nowISO()
     });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      step: "analytics_summary_error",
-      error: err.message
-    });
+  } catch (error) {
+    console.error("ANALYTICS SUMMARY ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get("/trend-summary", async (req, res) => {
   try {
-    const { data: rows, error } = await supabase
+    const { data, error } = await supabase
       .from("pick_history")
       .select("*")
-      .in("result", ["Win", "Loss"]);
+      .in("result", ["Win", "Loss"])
+      .order("graded_at", { ascending: false })
+      .limit(500);
 
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        step: "trend_fetch",
-        error: error.message
+    if (error) throw error;
+
+    const teamMap = {};
+
+    for (const p of data || []) {
+      const team = p.team_name || p.pick;
+      if (!team) continue;
+
+      if (!teamMap[team]) {
+        teamMap[team] = {
+          team_name: team,
+          wins: 0,
+          losses: 0,
+          total: 0,
+          win_rate: 0,
+          recent_picks: []
+        };
+      }
+
+      if (p.result === "Win") teamMap[team].wins++;
+      if (p.result === "Loss") teamMap[team].losses++;
+
+      teamMap[team].total++;
+      teamMap[team].recent_picks.push({
+        game: p.game,
+        result: p.result,
+        graded_at: p.graded_at,
+        confidence: p.confidence,
+        edge: p.edge
       });
     }
 
-    const allRows = Array.isArray(rows) ? rows : [];
-    const uniqueRows = uniquePickRows(allRows);
-
-    const teamGroups = groupBy(uniqueRows, "team_name");
-    const sectionGroups = groupBy(allRows, "section");
-    const sportGroups = groupBy(uniqueRows, "sport");
-
-    const teamStats = Object.keys(teamGroups).map(team => ({
-      team,
-      ...roiForRows(teamGroups[team]),
-      streak: currentStreak(teamGroups[team])
+    const teams = Object.values(teamMap).map(t => ({
+      ...t,
+      win_rate: t.total ? Number(((t.wins / t.total) * 100).toFixed(1)) : 0
     }));
 
-    const sectionStats = Object.keys(sectionGroups).map(section => ({
-      section,
-      ...roiForRows(sectionGroups[section]),
-      streak: currentStreak(sectionGroups[section])
-    }));
+    const hottestTeams = teams
+      .filter(t => t.total >= 2)
+      .sort((a, b) => b.win_rate - a.win_rate || b.wins - a.wins)
+      .slice(0, 10);
 
-    const sportStats = Object.keys(sportGroups).map(sport => ({
-      sport,
-      ...roiForRows(sportGroups[sport]),
-      streak: currentStreak(sportGroups[sport])
-    }));
+    const coldFadeTeams = teams
+      .filter(t => t.total >= 2)
+      .sort((a, b) => a.win_rate - b.win_rate || b.losses - a.losses)
+      .slice(0, 10);
 
-    const hottestTeams = [...teamStats]
-      .filter(t => t.total >= 3 && t.team !== "Unknown")
-      .sort((a, b) => b.roi - a.roi)
-      .slice(0, 5);
-
-    const coldFadeTeams = [...teamStats]
-      .filter(t => t.total >= 3 && t.team !== "Unknown")
-      .sort((a, b) => a.roi - b.roi)
-      .slice(0, 5);
-
-    const currentHeater = [...teamStats]
-      .filter(t => t.team !== "Unknown")
-      .sort((a, b) => (b.streak?.count || 0) - (a.streak?.count || 0))[0] || null;
-
-    const sharpestRecentPicks = [...uniqueRows]
-      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0))
-      .slice(0, 10)
-      .map(r => ({
-        pick: r.pick,
-        team_name: r.team_name,
-        sport: r.sport,
-        section: r.section,
-        confidence: r.confidence,
-        implied_probability: r.implied_probability,
-        edge: r.edge,
-        risk: r.risk,
-        result: r.result,
-        game: r.game
-      }));
+    const sharpestRecentPicks = (data || [])
+      .filter(p => p.result === "Win")
+      .sort((a, b) => Number(b.edge || 0) - Number(a.edge || 0))
+      .slice(0, 10);
 
     res.json({
       success: true,
-      mode: "smartbet_trend_summary_v2",
-      generatedAt: new Date().toISOString(),
-      hottestTeams,
-      coldFadeTeams,
-      hottestSection: [...sectionStats].sort((a, b) => b.roi - a.roi)[0] || null,
-      bestSport: [...sportStats].sort((a, b) => b.roi - a.roi)[0] || null,
-      mostConsistentSection: [...sectionStats].sort((a, b) => b.winRate - a.winRate)[0] || null,
-      currentHeater,
-      sharpestRecentPicks
+      hottest_teams: hottestTeams,
+      cold_fade_teams: coldFadeTeams,
+      sharpest_recent_picks: sharpestRecentPicks,
+      last_updated: nowISO()
     });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      step: "trend_summary_error",
-      error: err.message
-    });
-  }
-});
-
-app.get("/debug-scores", async (req, res) => {
-  try {
-    let allScoreGames = [];
-
-    for (const sport of SPORTS) {
-      const scoreUrl =
-        `https://api.the-odds-api.com/v4/sports/${sport}/scores/` +
-        `?apiKey=${ODDS_API_KEY}` +
-        `&daysFrom=3`;
-
-      const scoreResponse = await fetch(scoreUrl);
-      const scoreData = await scoreResponse.json();
-
-      if (Array.isArray(scoreData)) {
-        allScoreGames.push(...scoreData.map(g => ({ ...g, sport })));
-      }
-    }
-
-    res.json({
-      success: true,
-      mode: "debug_all_scores",
-      games_found: allScoreGames.length,
-      games: allScoreGames.map(g => ({
-        sport: g.sport,
-        home_team: g.home_team,
-        away_team: g.away_team,
-        commence_time: g.commence_time,
-        completed: g.completed,
-        scores: g.scores
-      }))
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+  } catch (error) {
+    console.error("TREND SUMMARY ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get("/debug-pending", async (req, res) => {
   try {
-    const { data: rows, error } = await supabase
+    const { data, error } = await supabase
       .from("pick_history")
-      .select("id,sport,pick,team_name,game,commence_time,result,actual_result,graded_at,inserted_at,confidence,implied_probability,edge,risk")
-      .eq("result", "Pending")
-      .order("inserted_at", { ascending: false })
-      .limit(50);
+      .select("*")
+      .or("status.eq.Pending,result.eq.Pending")
+      .order("commence_time", { ascending: true })
+      .limit(100);
 
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        step: "debug_pending_fetch",
-        error: error.message
-      });
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      pending_count: data?.length || 0,
+      pending: data || [],
+      time: nowISO()
+    });
+  } catch (error) {
+    console.error("DEBUG PENDING ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/debug-scores", async (req, res) => {
+  try {
+    const output = {};
+
+    for (const sport of SPORTS) {
+      const url =
+        `https://api.the-odds-api.com/v4/sports/${sport.key}/scores` +
+        `?apiKey=${ODDS_API_KEY}` +
+        `&daysFrom=3`;
+
+      const scores = await fetchJson(url);
+      output[sport.label] = scores;
     }
 
     res.json({
       success: true,
-      pending_found: rows ? rows.length : 0,
-      rows
+      scores: output,
+      time: nowISO()
     });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+  } catch (error) {
+    console.error("DEBUG SCORES ERROR:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`SmartBet scanner with Confidence Engine V2 running on port ${PORT}`);
+  console.log(`SmartBet backend running on port ${PORT}`);
 });
