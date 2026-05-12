@@ -176,6 +176,7 @@ function confidenceEngineV2({ odds, homeTeam, teamName }) {
 }
 
 function passesEVFilter(pick) {
+
   const odds = Number(pick.odds || 0);
   const confidence = Number(pick.confidence || 0);
   const edge = Number(pick.edge || 0);
@@ -184,13 +185,63 @@ function passesEVFilter(pick) {
   if (!Number.isFinite(odds)) return false;
   if (!Number.isFinite(confidence)) return false;
 
-  if (odds <= -260) return false;
-  if (confidence < 70) return false;
-  if (edge < 3) return false;
-  if (ev < 0) return false;
+  /*
+    CORE FILTERS
+  */
 
-  if (odds > 140 && confidence < 78) return false;
-  if (odds <= -180 && confidence < 75) return false;
+  if (confidence < 75) return false;
+
+  if (edge < 5) return false;
+
+  if (ev < 0.08) return false;
+
+  /*
+    FAVORITE CONTROL
+  */
+
+  if (odds <= -220) return false;
+
+  if (odds <= -180 && confidence < 80) return false;
+
+  /*
+    UNDERDOG CONTROL
+  */
+
+  if (odds >= 160 && confidence < 80) return false;
+
+  /*
+    MLB TIGHTENING
+  */
+
+  if (
+    pick.sport === "MLB" &&
+    odds <= -170 &&
+    edge < 7
+  ) {
+    return false;
+  }
+
+  /*
+    VOLATILITY FILTER
+  */
+
+  if (
+    pick.volatility === "High" &&
+    confidence < 82
+  ) {
+    return false;
+  }
+
+  /*
+    TRAP WARNING FILTER
+  */
+
+  if (
+    pick.trap_warning &&
+    pick.trap_warning !== "None"
+  ) {
+    return false;
+  }
 
   return true;
 }
