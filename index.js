@@ -1684,10 +1684,110 @@ app.get("/debug-scores", async (req, res) => {
   }
 });
 
-
 app.get("/debug-props", async (req, res) => {
+  try {
+
+    const { data, error } = await supabase
+      .from("picks")
+      .select("*")
+      .eq("bet_type", "player_prop")
+      .order("created_at", { ascending: false })
+      .limit(25);
+
+    if (error) {
+      console.error("DEBUG PROPS ERROR:", error);
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+
+    res.json({
+      success: true,
+      props_count: data?.length || 0,
+      props: data || [],
+      time: nowISO()
+    });
+
+  } catch (error) {
+
+    console.error("DEBUG PROPS CATCH:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+  }
+});
+
+app.get("/scan-props", async (req, res) => {
 
   try {
+
+    console.log("SCAN PROPS STARTED");
+
+    const { data: insertedProps, error: insertError } = await supabase
+      .from("picks")
+      .insert([
+        {
+          sport: "MLB",
+          game: "Demo Player Props",
+          pick: "Aaron Judge Over 1.5 Hits",
+          odds: -125,
+          confidence: 78.5,
+          edge: 18.2,
+          expected_value: 0.34,
+          market_confidence: "Balanced Market",
+          volatility: "Medium",
+          trap_warning: "None",
+          section: "Balanced Prop Slip",
+          bet_type: "player_prop",
+          prop_type: "Hits",
+          status: "Pending",
+          event_time_label: "Starts Tonight",
+          today_play: true,
+          early_value: false,
+          hours_until_game: 2.5,
+          commence_time: new Date().toISOString(),
+          created_at: new Date().toISOString()
+        }
+      ])
+      .select();
+
+    if (insertError) {
+
+      console.error("SCAN PROPS INSERT ERROR:", insertError);
+
+      return res.status(500).json({
+        success: false,
+        error: insertError.message
+      });
+    }
+
+    console.log("SCAN PROPS SUCCESS");
+
+    res.json({
+      success: true,
+      inserted: insertedProps?.length || 0,
+      props: insertedProps || [],
+      time: nowISO()
+    });
+
+  } catch (error) {
+
+    console.error("SCAN PROPS CATCH:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+
+  }
+
+});
+
+  
 
     const { data, error } =
       await supabase
