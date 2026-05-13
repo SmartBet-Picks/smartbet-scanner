@@ -1555,13 +1555,18 @@ app.get("/debug-scores", async (req, res) => {
 
 
 app.get("/debug-props", async (req, res) => {
+
   try {
-    const { data, error } = await supabase
-      .from("picks")
-      .select("*")
-      .eq("bet_type", "player_prop")
-      .order("confidence", { ascending: false })
-      .limit(100);
+
+    const { data, error } =
+      await supabase
+        .from("picks")
+        .select("*")
+        .eq("bet_type", "player_prop")
+        .order("created_at", {
+          ascending: false
+        })
+        .limit(100);
 
     if (error) throw error;
 
@@ -1571,12 +1576,17 @@ app.get("/debug-props", async (req, res) => {
       props: data || [],
       time: nowISO()
     });
-  } catch (error) {
-    console.error("DEBUG PROPS ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
-app.listen(PORT, () => {
-  console.log(`SmartBet backend running on port ${PORT}`);
+  } catch (error) {
+
+    console.error(
+      "DEBUG PROPS ERROR:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
