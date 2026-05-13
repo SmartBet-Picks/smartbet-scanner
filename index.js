@@ -568,9 +568,14 @@ app.get("/scan", async (req, res) => {
 
     if (finalPicks.length > 0) {
   const { error } = await supabase.from("picks").insert(finalPicks);
-  if (error) throw error;
 
-  await supabase.from("pick_history").insert(finalPicks);
+  if (error) {
+    console.error(error);
+    throw error;
+  }
+
+  // TEMP DISABLED PICK HISTORY INSERT
+  console.log("Skipping pick_history insert temporarily");
 }
 
     res.json({
