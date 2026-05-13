@@ -32,10 +32,7 @@ const ODDS_FORMAT = "american";
 const DEFAULT_STAKE = 10;
 
 const SPORTS = [
-  { key: "baseball_mlb", label: "MLB" },
-  { key: "basketball_nba", label: "NBA" },
-  { key: "americanfootball_nfl", label: "NFL" },
-  { key: "mma_mixed_martial_arts", label: "UFC" }
+  { key: "baseball_mlb", label: "MLB" }
 ];
 
 function nowISO() {
