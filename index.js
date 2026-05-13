@@ -13,27 +13,10 @@ const PORT = process.env.PORT || 3000;
 
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
-if (!SUPABASE_URL) {
-  console.error("Missing SUPABASE_URL");
-}
-
-if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_SERVICE_ROLE_KEY");
-}
-
-const supabase = createClient(
-  SUPABASE_URL || "https://nriyaljkscxzelywjhoe.supabase.co",
-  SUPABASE_SERVICE_ROLE_KEY || "missing-service-role-key",
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false
-    }
-  }
-);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const BOOKMAKER_KEY = "draftkings";
 const REGIONS = "us";
@@ -97,6 +80,7 @@ function calculateExpectedValue(odds, confidence) {
       : 100 / Math.abs(n) + 1;
 
   const winProbability = c / 100;
+
   const expectedValue =
     winProbability * (decimalOdds - 1) - (1 - winProbability);
 
@@ -138,13 +122,11 @@ function getTrapWarning({ odds, impliedProbability, confidence, edge, expectedVa
 
 function getHoursUntilGame(commenceTime) {
   if (!commenceTime) return null;
-
   const gameTime = new Date(commenceTime);
   if (Number.isNaN(gameTime.getTime())) return null;
 
   const now = new Date();
   const diffMs = gameTime.getTime() - now.getTime();
-
   return Number((diffMs / (1000 * 60 * 60)).toFixed(2));
 }
 
@@ -158,15 +140,18 @@ function getEventTimeLabel(hoursUntilGame) {
 
 function getTimingFlags(commenceTime) {
   const hoursUntilGame = getHoursUntilGame(commenceTime);
+  const todayPlay =
+    hoursUntilGame != null &&
+    hoursUntilGame >= 0 &&
+    hoursUntilGame <= 24;
+
+  const earlyValue =
+    hoursUntilGame != null &&
+    hoursUntilGame > 24;
 
   return {
-    today_play:
-      hoursUntilGame != null &&
-      hoursUntilGame >= 0 &&
-      hoursUntilGame <= 24,
-    early_value:
-      hoursUntilGame != null &&
-      hoursUntilGame > 24,
+    today_play: todayPlay,
+    early_value: earlyValue,
     hours_until_game: hoursUntilGame,
     event_time_label: getEventTimeLabel(hoursUntilGame)
   };
@@ -191,6 +176,7 @@ function confidenceEngineV2({ odds, homeTeam, teamName }) {
 }
 
 function passesEVFilter(pick) {
+
   const odds = Number(pick.odds || 0);
   const confidence = Number(pick.confidence || 0);
   const edge = Number(pick.edge || 0);
@@ -199,19 +185,63 @@ function passesEVFilter(pick) {
   if (!Number.isFinite(odds)) return false;
   if (!Number.isFinite(confidence)) return false;
 
+  /*
+    CORE FILTERS
+  */
+
   if (confidence < 75) return false;
+
   if (edge < 5) return false;
+
   if (ev < 0.08) return false;
 
+  /*
+    FAVORITE CONTROL
+  */
+
   if (odds <= -220) return false;
+
   if (odds <= -180 && confidence < 80) return false;
+
+  /*
+    UNDERDOG CONTROL
+  */
+
   if (odds >= 160 && confidence < 80) return false;
 
-  if (pick.sport === "MLB" && odds <= -170 && edge < 7) return false;
+  /*
+    MLB TIGHTENING
+  */
 
-  if (pick.volatility === "High" && confidence < 82) return false;
+  if (
+    pick.sport === "MLB" &&
+    odds <= -170 &&
+    edge < 7
+  ) {
+    return false;
+  }
 
-  if (pick.trap_warning && pick.trap_warning !== "None") return false;
+  /*
+    VOLATILITY FILTER
+  */
+
+  if (
+    pick.volatility === "High" &&
+    confidence < 82
+  ) {
+    return false;
+  }
+
+  /*
+    TRAP WARNING FILTER
+  */
+
+  if (
+    pick.trap_warning &&
+    pick.trap_warning !== "None"
+  ) {
+    return false;
+  }
 
   return true;
 }
@@ -335,98 +365,33 @@ function smartbetIsValidScannerGame(game, sportKey) {
   return true;
 }
 
-async function fetchJson(url, timeoutMs = 7000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+async function fetchJson(url) {
+  const res = await fetch(url);
+  const text = await res.text();
+
+  if (!res.ok) throw new Error(`Fetch failed ${res.status}: ${text}`);
 
   try {
-    const res = await fetch(url, { signal: controller.signal });
-    const text = await res.text();
-
-    if (!res.ok) throw new Error(`Fetch failed ${res.status}: ${text}`);
-
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`Invalid JSON: ${text}`);
-    }
-  } finally {
-    clearTimeout(timeout);
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid JSON: ${text}`);
   }
 }
 
-function historyPayloadFromPick(pick) {
-  return {
-    sport: pick.sport,
-    game: pick.game,
-    market: pick.market,
-    pick: pick.pick,
-    odds: pick.odds,
-    book: pick.book || null,
-    score: pick.score || null,
-    risk: pick.risk,
-    reason: pick.reason || null,
-    stake: pick.stake || null,
-    profit: pick.profit || null,
-    payout: pick.payout || null,
-    bet_link: pick.bet_link || null,
-    confidence: pick.confidence,
-    section: pick.section,
-    commence_time: pick.commence_time,
-    team_name: pick.team_name,
-    edge: pick.edge,
-    implied_probability: pick.implied_probability,
-    market_confidence: pick.market_confidence,
-    volatility: pick.volatility,
-    trap_warning: pick.trap_warning,
-    actual_result: null,
-    graded_at: null,
-    game_date: pick.game_date,
-    sport_key: pick.sport_key,
-    event_id: pick.event_id,
-    status: "Pending",
-    result: "Pending",
-    updated_at: nowISO(),
-    home_team: pick.home_team,
-    away_team: pick.away_team,
-    bookmaker: pick.bookmaker,
-    expected_value: pick.expected_value
-  };
-}
-
-async function savePickHistoryBulk(finalPicks) {
-  if (!finalPicks.length) return;
-
-  const historyRows = finalPicks.map(historyPayloadFromPick);
-
-  const { error } = await supabase
+async function insertPickHistoryIfMissing(pick) {
+  const { data: existing } = await supabase
     .from("pick_history")
-    .insert(historyRows);
+    .select("id")
+    .eq("sport", pick.sport)
+    .eq("team_name", pick.team_name)
+    .eq("home_team", pick.home_team)
+    .eq("away_team", pick.away_team)
+    .eq("commence_time", pick.commence_time)
+    .limit(1);
 
-  if (error) {
-    console.error("PICK HISTORY INSERT WARNING:", error.message || error);
-  }
-}
+  if (existing && existing.length > 0) return;
 
-async function fetchSportGames(sport) {
-  const url =
-    `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
-    `?apiKey=${ODDS_API_KEY}` +
-    `&regions=${REGIONS}` +
-    `&markets=${MARKETS}` +
-    `&oddsFormat=${ODDS_FORMAT}` +
-    `&bookmakers=${BOOKMAKER_KEY}`;
-
-  try {
-    const games = await fetchJson(url, 7000);
-    return { sport, games: games || [], error: null };
-  } catch (error) {
-    return {
-      sport,
-      games: [],
-      error: error.message || String(error)
-    };
-  }
+  await supabase.from("pick_history").insert([pick]);
 }
 
 app.get("/", (req, res) => {
@@ -436,12 +401,6 @@ app.get("/", (req, res) => {
     bookmaker: "DraftKings only",
     market: "Moneyline",
     engine: "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split",
-    sports: SPORTS.map(s => s.label),
-    env_check: {
-      odds_api_key: Boolean(ODDS_API_KEY),
-      supabase_url: Boolean(SUPABASE_URL),
-      service_role_key: Boolean(SUPABASE_SERVICE_ROLE_KEY)
-    },
     routes: [
       "/",
       "/scan",
@@ -458,39 +417,22 @@ app.get("/", (req, res) => {
 
 app.get("/scan", async (req, res) => {
   try {
-    if (!ODDS_API_KEY) {
-      return res.status(500).json({
-        success: false,
-        error: "Missing ODDS_API_KEY"
-      });
-    }
-
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-      return res.status(500).json({
-        success: false,
-        error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY"
-      });
-    }
-
     const allPicks = [];
     const skippedGames = [];
     const filteredPicks = [];
-    const sportErrors = [];
 
-    const sportResults = await Promise.all(SPORTS.map(fetchSportGames));
+    for (const sport of SPORTS) {
+      const url =
+        `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
+        `?apiKey=${ODDS_API_KEY}` +
+        `&regions=${REGIONS}` +
+        `&markets=${MARKETS}` +
+        `&oddsFormat=${ODDS_FORMAT}` +
+        `&bookmakers=${BOOKMAKER_KEY}`;
 
-    for (const result of sportResults) {
-      const sport = result.sport;
+      const games = await fetchJson(url);
 
-      if (result.error) {
-        sportErrors.push({
-          sport: sport.label,
-          error: result.error
-        });
-        continue;
-      }
-
-      for (const game of result.games || []) {
+      for (const game of games || []) {
         if (!smartbetIsValidScannerGame(game, sport.key)) {
           skippedGames.push({
             sport: sport.label,
@@ -618,36 +560,22 @@ app.get("/scan", async (req, res) => {
       })
       .slice(0, 40);
 
-    const { error: deleteError } = await supabase
-      .from("picks")
-      .delete()
-      .neq("id", 0);
-
-    if (deleteError) {
-      console.error("PICKS DELETE ERROR:", deleteError);
-      throw deleteError;
-    }
+    await supabase.from("picks").delete().neq("id", 0);
 
     if (finalPicks.length > 0) {
-      const { error: insertError } = await supabase
-        .from("picks")
-        .insert(finalPicks);
+      const { error } = await supabase.from("picks").insert(finalPicks);
+      if (error) throw error;
 
-      if (insertError) {
-        console.error("PICKS INSERT ERROR:", insertError);
-        throw insertError;
+      for (const pick of finalPicks) {
+        await insertPickHistoryIfMissing(pick);
       }
-
-      savePickHistoryBulk(finalPicks).catch(error => {
-        console.error("BACKGROUND HISTORY INSERT ERROR:", error.message || error);
-      });
     }
 
     res.json({
       success: true,
       message: "Clean EV scan complete with Today’s Top Plays + Early Value Plays",
       filter_note:
-        "MLB, NBA, NFL, and UFC are enabled. UFC future cards are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays.",
+        "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays.",
       bookmaker: "DraftKings",
       market: "Moneyline",
       total_saved: finalPicks.length,
@@ -655,7 +583,6 @@ app.get("/scan", async (req, res) => {
       early_value_plays_count: finalPicks.filter(p => p.early_value).length,
       skipped_games_count: skippedGames.length,
       ev_filtered_picks_count: filteredPicks.length,
-      sport_errors_count: sportErrors.length,
       top_5_count: finalPicks.filter(p => p.section === "Top 5 Locks").length,
       free_pick_count: finalPicks.filter(p => p.section === "Free Pick").length,
       time: nowISO(),
@@ -663,15 +590,11 @@ app.get("/scan", async (req, res) => {
       today_top_plays: finalPicks.filter(p => p.today_play),
       early_value_plays: finalPicks.filter(p => p.early_value),
       skipped_games: skippedGames.slice(0, 25),
-      ev_filtered_picks: filteredPicks.slice(0, 25),
-      sport_errors: sportErrors
+      ev_filtered_picks: filteredPicks.slice(0, 25)
     });
   } catch (error) {
     console.error("SCAN ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -702,16 +625,9 @@ app.get("/grade", async (req, res) => {
         continue;
       }
 
-      const sportConfig = SPORTS.find(
-        s => s.label === pick.sport || s.key === pick.sport_key
-      );
-
+      const sportConfig = SPORTS.find(s => s.label === pick.sport || s.key === pick.sport_key);
       if (!sportConfig) {
-        skipped.push({
-          id: pick.id,
-          reason: "Unknown sport",
-          game: pick.game
-        });
+        skipped.push({ id: pick.id, reason: "Unknown sport", game: pick.game });
         continue;
       }
 
@@ -720,14 +636,13 @@ app.get("/grade", async (req, res) => {
         `?apiKey=${ODDS_API_KEY}` +
         `&daysFrom=3`;
 
-      const scores = await fetchJson(url, 7000);
+      const scores = await fetchJson(url);
       const pickDate = toDateOnly(pick.commence_time);
 
       const match = (scores || []).find(game => {
         const sameDate = toDateOnly(game.commence_time) === pickDate;
         const sameHome = normalizeTeam(game.home_team) === normalizeTeam(pick.home_team);
         const sameAway = normalizeTeam(game.away_team) === normalizeTeam(pick.away_team);
-
         return sameDate && sameHome && sameAway;
       });
 
@@ -752,13 +667,8 @@ app.get("/grade", async (req, res) => {
       }
 
       const scoresArr = match.scores || [];
-
       if (scoresArr.length < 2) {
-        skipped.push({
-          id: pick.id,
-          reason: "Scores missing",
-          game: pick.game
-        });
+        skipped.push({ id: pick.id, reason: "Scores missing", game: pick.game });
         continue;
       }
 
@@ -771,11 +681,7 @@ app.get("/grade", async (req, res) => {
       );
 
       if (!teamScore || !opponentScore) {
-        skipped.push({
-          id: pick.id,
-          reason: "Team score not matched",
-          game: pick.game
-        });
+        skipped.push({ id: pick.id, reason: "Team score not matched", game: pick.game });
         continue;
       }
 
@@ -783,11 +689,7 @@ app.get("/grade", async (req, res) => {
       const oppPoints = Number(opponentScore.score);
 
       if (!Number.isFinite(teamPoints) || !Number.isFinite(oppPoints)) {
-        skipped.push({
-          id: pick.id,
-          reason: "Invalid score values",
-          game: pick.game
-        });
+        skipped.push({ id: pick.id, reason: "Invalid score values", game: pick.game });
         continue;
       }
 
@@ -837,10 +739,7 @@ app.get("/grade", async (req, res) => {
     });
   } catch (error) {
     console.error("GRADE ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -884,9 +783,7 @@ app.get("/results-summary", async (req, res) => {
     const losses = unique.filter(p => p.result === "Loss").length;
     const total = wins + losses;
     const winRate = total ? Number(((wins / total) * 100).toFixed(1)) : 0;
-    const roi = total
-      ? Number(((profit / (total * DEFAULT_STAKE)) * 100).toFixed(1))
-      : 0;
+    const roi = total ? Number(((profit / (total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
 
     res.json({
       success: true,
@@ -901,10 +798,7 @@ app.get("/results-summary", async (req, res) => {
     });
   } catch (error) {
     console.error("RESULTS SUMMARY ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -973,24 +867,16 @@ app.get("/analytics-summary", async (req, res) => {
 
     for (const key of Object.keys(sectionAnalytics)) {
       const x = sectionAnalytics[key];
-      x.win_rate = x.total
-        ? Number(((x.wins / x.total) * 100).toFixed(1))
-        : 0;
+      x.win_rate = x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
       x.profit = Number(x.profit.toFixed(2));
-      x.roi = x.total
-        ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1))
-        : 0;
+      x.roi = x.total ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
     }
 
     for (const key of Object.keys(sportAnalytics)) {
       const x = sportAnalytics[key];
-      x.win_rate = x.total
-        ? Number(((x.wins / x.total) * 100).toFixed(1))
-        : 0;
+      x.win_rate = x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
       x.profit = Number(x.profit.toFixed(2));
-      x.roi = x.total
-        ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1))
-        : 0;
+      x.roi = x.total ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
     }
 
     res.json({
@@ -1001,10 +887,7 @@ app.get("/analytics-summary", async (req, res) => {
     });
   } catch (error) {
     console.error("ANALYTICS SUMMARY ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -1065,13 +948,9 @@ app.get("/trend-summary", async (req, res) => {
 
     const teams = Object.values(teamMap).map(t => ({
       ...t,
-      win_rate: t.total
-        ? Number(((t.wins / t.total) * 100).toFixed(1))
-        : 0,
+      win_rate: t.total ? Number(((t.wins / t.total) * 100).toFixed(1)) : 0,
       profit: Number(t.profit.toFixed(2)),
-      roi: t.total
-        ? Number(((t.profit / (t.total * DEFAULT_STAKE)) * 100).toFixed(1))
-        : 0
+      roi: t.total ? Number(((t.profit / (t.total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0
     }));
 
     const hottestTeams = teams
@@ -1102,10 +981,7 @@ app.get("/trend-summary", async (req, res) => {
     });
   } catch (error) {
     console.error("TREND SUMMARY ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -1128,10 +1004,7 @@ app.get("/debug-pending", async (req, res) => {
     });
   } catch (error) {
     console.error("DEBUG PENDING ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -1139,30 +1012,14 @@ app.get("/debug-scores", async (req, res) => {
   try {
     const output = {};
 
-    const scoreResults = await Promise.all(
-      SPORTS.map(async sport => {
-        const url =
-          `https://api.the-odds-api.com/v4/sports/${sport.key}/scores` +
-          `?apiKey=${ODDS_API_KEY}` +
-          `&daysFrom=3`;
+    for (const sport of SPORTS) {
+      const url =
+        `https://api.the-odds-api.com/v4/sports/${sport.key}/scores` +
+        `?apiKey=${ODDS_API_KEY}` +
+        `&daysFrom=3`;
 
-        try {
-          const scores = await fetchJson(url, 7000);
-          return { sport: sport.label, scores, error: null };
-        } catch (error) {
-          return {
-            sport: sport.label,
-            scores: [],
-            error: error.message || String(error)
-          };
-        }
-      })
-    );
-
-    for (const item of scoreResults) {
-      output[item.sport] = item.error
-        ? { error: item.error, scores: [] }
-        : item.scores;
+      const scores = await fetchJson(url);
+      output[sport.label] = scores;
     }
 
     res.json({
@@ -1172,10 +1029,7 @@ app.get("/debug-scores", async (req, res) => {
     });
   } catch (error) {
     console.error("DEBUG SCORES ERROR:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || String(error)
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
