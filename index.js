@@ -769,45 +769,53 @@ app.get("/scan-props", async (req, res) => {
     const allProps = [];
     const skippedGames = [];
     const filteredProps = [];
-    const propErrors = [];
+
+    const MAX_GAMES_PER_SPORT = 3;
+    const MAX_MARKETS_PER_SPORT = 2;
+    const MAX_FINAL_PROPS = 40;
 
     for (const sport of SPORTS) {
-      const eventListUrl =
+      const propMarkets = PLAYER_PROP_MARKETS[sport.key] || [];
+
+      if (!propMarkets.length) continue;
+
+      const limitedMarkets = propMarkets.slice(0, MAX_MARKETS_PER_SPORT);
+
+      const gamesUrl =
         `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
         `?apiKey=${ODDS_API_KEY}` +
         `&regions=${REGIONS}` +
-        `&markets=${MARKETS}` +
+        `&markets=h2h` +
         `&oddsFormat=${ODDS_FORMAT}` +
         `&bookmakers=${BOOKMAKER_KEY}`;
 
       let games = [];
 
       try {
-        games = await fetchJson(eventListUrl);
-      } catch (error) {
-        propErrors.push({ sport: sport.label, stage: "events", error: error.message });
+        games = await fetchJson(gamesUrl);
+      } catch (err) {
+        skippedGames.push({
+          sport: sport.label,
+          reason: `Failed to fetch games: ${err.message}`
+        });
         continue;
       }
 
-      for (const game of games || []) {
-        if (!smartbetIsValidScannerGame(game, sport.key)) {
-          skippedGames.push({
-            sport: sport.label,
-            game: `${game?.away_team || "Unknown"} @ ${game?.home_team || "Unknown"}`,
-            commence_time: game?.commence_time || null,
-            reason: "Filtered out by same valid-game window used by moneyline scanner"
-          });
-          continue;
-        }
+      const validGames = (games || [])
+        .filter(game => smartbetIsValidScannerGame(game, sport.key))
+        .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time))
+        .slice(0, MAX_GAMES_PER_SPORT);
 
-        const marketKeys = PLAYER_PROP_MARKETS[sport.key] || [];
-        if (marketKeys.length === 0) continue;
+      for (const game of validGames) {
+        const eventId = game.id;
+
+        if (!eventId) continue;
 
         const propsUrl =
-          `https://api.the-odds-api.com/v4/sports/${sport.key}/events/${game.id}/odds` +
+          `https://api.the-odds-api.com/v4/sports/${sport.key}/events/${eventId}/odds` +
           `?apiKey=${ODDS_API_KEY}` +
           `&regions=${REGIONS}` +
-          `&markets=${marketKeys.join(",")}` +
+          `&markets=${limitedMarkets.join(",")}` +
           `&oddsFormat=${ODDS_FORMAT}` +
           `&bookmakers=${BOOKMAKER_KEY}`;
 
@@ -815,108 +823,168 @@ app.get("/scan-props", async (req, res) => {
 
         try {
           eventProps = await fetchJson(propsUrl);
-        } catch (error) {
-          propErrors.push({
+        } catch (err) {
+          skippedGames.push({
             sport: sport.label,
-            game: `${game.away_team} @ ${game.home_team}`,
-            event_id: game.id,
-            stage: "props",
-            error: error.message
+            game: `${game.away_team || "Unknown"} @ ${game.home_team || "Unknown"}`,
+            event_id: eventId,
+            reason: `Failed to fetch props: ${err.message}`
           });
           continue;
         }
 
-        const bookmaker = (eventProps.bookmakers || []).find(b => b.key === BOOKMAKER_KEY);
+        const bookmaker = (eventProps.bookmakers || []).find(
+          b => b.key === BOOKMAKER_KEY
+        );
+
         if (!bookmaker) continue;
 
         for (const market of bookmaker.markets || []) {
+          if (!limitedMarkets.includes(market.key)) continue;
+
           for (const outcome of market.outcomes || []) {
             const odds = Number(outcome.price);
+
             if (!Number.isFinite(odds)) continue;
 
-            const side = normalizeOutcomeSide(outcome.name);
-            const playerName = getPropPlayerName(outcome);
-            const line = outcome.point == null ? null : Number(outcome.point);
+            const playerName =
+              outcome.description ||
+              outcome.name ||
+              "Unknown Player";
+
+            const line =
+              outcome.point !== undefined && outcome.point !== null
+                ? Number(outcome.point)
+                : null;
+
+            const overUnder = outcome.name || null;
+
             const impliedRaw = americanToImpliedProbability(odds);
 
             const confidence = sharpPropConfidence({
               odds,
               line: line || 0,
               marketKey: market.key,
-              overUnder: side
+              overUnder
             });
 
             const edge = calculateEdge(impliedRaw, confidence);
             const expectedValue = calculateExpectedValue(odds, confidence);
-            const volatility = propVolatility(market.key, odds, line, side);
-            const marketConfidence = getPropMarketConfidence(impliedRaw || 0, odds, edge || 0);
-            const trapWarning = getPropTrapWarning({
+            const volatility = propVolatility(market.key, odds);
+
+            const trapWarning = propTrapWarning({
               odds,
               confidence,
               edge,
-              expectedValue,
-              volatility,
-              marketKey: market.key,
-              overUnder: side
+              expectedValue
             });
+
             const timingFlags = getTimingFlags(game.commence_time);
-            const propType = normalizePropType(market.key);
-            const pickText = `${playerName} ${side}${line == null ? "" : " " + line} ${propType}`;
 
             const prop = {
               sport: sport.label,
               sport_key: sport.key,
               bet_type: "player_prop",
-              event_id: game.id || null,
+
+              event_id: eventId,
               game: `${game.away_team} @ ${game.home_team}`,
               home_team: game.home_team,
               away_team: game.away_team,
+
               team_name: playerName,
-              pick: pickText,
-              market: propType,
+              pick: playerName,
+              player_name: playerName,
+
+              market: normalizePropType(market.key),
+              prop_type: normalizePropType(market.key),
+              prop_market_key: market.key,
+
+              over_under: overUnder,
+              line,
+
               bookmaker: "DraftKings",
               odds,
-              implied_probability: impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
+
+              implied_probability:
+                impliedRaw == null
+                  ? null
+                  : Number((impliedRaw * 100).toFixed(2)),
+
               confidence,
               edge,
               expected_value: expectedValue,
-              risk: getRiskLabel(confidence, odds),
-              market_confidence: marketConfidence,
+
+              risk:
+                volatility === "High"
+                  ? "High"
+                  : confidence >= 80
+                    ? "Low"
+                    : "Medium",
+
+              market_confidence: getMarketConfidence(impliedRaw, odds),
               volatility,
               trap_warning: trapWarning,
+
+              section: "Balanced Prop Slip",
+
               commence_time: game.commence_time,
               game_date: toDateOnly(game.commence_time),
+
               today_play: timingFlags.today_play,
               early_value: timingFlags.early_value,
               hours_until_game: timingFlags.hours_until_game,
               event_time_label: timingFlags.event_time_label,
+
               status: "Pending",
               result: "Pending",
               actual_result: null,
-              graded_at: null,
-              player_name: playerName,
-              prop_type: propType,
-              line,
-              over_under: side,
               prop_result_value: null,
-              prop_market_key: market.key,
-              prop_id: `${game.id}|${playerName}|${market.key}|${side}|${line}`,
+              graded_at: null,
+
+              prop_id: [
+                eventId,
+                playerName,
+                market.key,
+                overUnder,
+                line
+              ].join("|"),
+
               created_at: nowISO(),
               updated_at: nowISO()
             };
 
-            if (!passesPropEVFilter(prop)) {
+            if (confidence < 70) {
               filteredProps.push({
-                sport: sport.label,
-                game: prop.game,
-                pick: prop.pick,
-                odds: prop.odds,
-                confidence: prop.confidence,
-                edge: prop.edge,
-                expected_value: prop.expected_value,
-                volatility: prop.volatility,
-                trap_warning: prop.trap_warning,
-                reason: "Filtered out by sharp prop EV / trap / volatility rules"
+                player: playerName,
+                prop_type: prop.prop_type,
+                reason: "Confidence below 70"
+              });
+              continue;
+            }
+
+            if (edge == null || edge < 3) {
+              filteredProps.push({
+                player: playerName,
+                prop_type: prop.prop_type,
+                reason: "Edge below 3"
+              });
+              continue;
+            }
+
+            if (expectedValue == null || expectedValue < 0) {
+              filteredProps.push({
+                player: playerName,
+                prop_type: prop.prop_type,
+                reason: "Negative EV"
+              });
+              continue;
+            }
+
+            if (volatility === "High" && confidence < 78) {
+              filteredProps.push({
+                player: playerName,
+                prop_type: prop.prop_type,
+                reason: "High volatility without enough confidence"
               });
               continue;
             }
@@ -927,55 +995,118 @@ app.get("/scan-props", async (req, res) => {
       }
     }
 
-    const finalProps = assignPropSections(uniqueProps(allProps))
+    const uniqueProps = [];
+    const seen = new Set();
+
+    for (const prop of allProps) {
+      const key = prop.prop_id;
+
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueProps.push(prop);
+      }
+    }
+
+    const sortedProps = uniqueProps
       .sort((a, b) => {
         const todayA = a.today_play ? 1 : 0;
         const todayB = b.today_play ? 1 : 0;
+
         if (todayB - todayA !== 0) return todayB - todayA;
-        const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
+
+        const evDiff =
+          Number(b.expected_value || 0) -
+          Number(a.expected_value || 0);
+
         if (evDiff !== 0) return evDiff;
-        const edgeDiff = Number(b.edge || 0) - Number(a.edge || 0);
+
+        const edgeDiff =
+          Number(b.edge || 0) -
+          Number(a.edge || 0);
+
         if (edgeDiff !== 0) return edgeDiff;
+
         return Number(b.confidence || 0) - Number(a.confidence || 0);
       })
-      .slice(0, PROP_MAX_PER_SCAN);
+      .slice(0, MAX_FINAL_PROPS);
 
-    await supabase.from("picks").delete().eq("bet_type", "player_prop");
+    const finalProps = sortedProps.map((prop, index) => {
+      let section = "Aggressive Prop Slip";
+
+      if (index === 0) {
+        section = "Free Prop Pick";
+      } else if (index < 5) {
+        section = "Top 5 Props";
+      } else if (prop.confidence >= 80 && prop.volatility !== "High") {
+        section = "Safe Prop Slip";
+      } else if (prop.confidence >= 73) {
+        section = "Balanced Prop Slip";
+      }
+
+      return {
+        ...prop,
+        section
+      };
+    });
+
+    await supabase
+      .from("picks")
+      .delete()
+      .eq("bet_type", "player_prop");
 
     if (finalProps.length > 0) {
-      const { error } = await supabase.from("picks").insert(finalProps);
-      if (error) throw error;
+      const { error: insertError } = await supabase
+        .from("picks")
+        .insert(finalProps);
+
+      if (insertError) throw insertError;
 
       for (const prop of finalProps) {
-        await insertPropHistoryIfMissing(prop);
+        const { data: existing } = await supabase
+          .from("pick_history")
+          .select("id")
+          .eq("bet_type", "player_prop")
+          .eq("prop_id", prop.prop_id)
+          .limit(1);
+
+        if (!existing || existing.length === 0) {
+          await supabase
+            .from("pick_history")
+            .insert([prop]);
+        }
       }
     }
 
     res.json({
       success: true,
-      message: "Elite +EV player props scan complete",
-      note: "Props are added alongside the existing moneyline engine. Moneyline picks are not removed by this route.",
-      bookmaker: "DraftKings",
-      bet_type: "player_prop",
-      total_saved: finalProps.length,
-      today_top_props_count: finalProps.filter(p => p.today_play).length,
-      early_value_props_count: finalProps.filter(p => p.early_value).length,
-      top_5_props_count: finalProps.filter(p => p.section === "Top 5 Props").length,
-      free_prop_count: finalProps.filter(p => p.section === "Free Prop Pick").length,
+      message: "Lite Elite Props Scanner Complete",
+      note:
+        "This lightweight version limits games and markets to prevent Railway timeout.",
+      total_props_saved: finalProps.length,
+      today_props: finalProps.filter(p => p.today_play).length,
+      early_value_props: finalProps.filter(p => p.early_value).length,
+      top_5_props: finalProps.filter(p => p.section === "Top 5 Props").length,
+      free_prop_pick: finalProps.filter(p => p.section === "Free Prop Pick").length,
       skipped_games_count: skippedGames.length,
       filtered_props_count: filteredProps.length,
-      prop_error_count: propErrors.length,
-      time: nowISO(),
+      limits: {
+        max_games_per_sport: MAX_GAMES_PER_SPORT,
+        max_markets_per_sport: MAX_MARKETS_PER_SPORT,
+        max_final_props: MAX_FINAL_PROPS
+      },
       props: finalProps,
-      today_top_props: finalProps.filter(p => p.today_play),
-      early_value_props: finalProps.filter(p => p.early_value),
-      skipped_games: skippedGames.slice(0, 25),
-      filtered_props: filteredProps.slice(0, 25),
-      prop_errors: propErrors.slice(0, 25)
+      skipped_games: skippedGames.slice(0, 20),
+      filtered_props: filteredProps.slice(0, 20),
+      last_updated: nowISO()
     });
+
   } catch (error) {
     console.error("SCAN PROPS ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
