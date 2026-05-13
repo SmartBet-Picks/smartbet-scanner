@@ -567,13 +567,11 @@ app.get("/scan", async (req, res) => {
     await supabase.from("picks").delete().neq("id", 0);
 
     if (finalPicks.length > 0) {
-      const { error } = await supabase.from("picks").insert(finalPicks);
-      if (error) throw error;
+  const { error } = await supabase.from("picks").insert(finalPicks);
+  if (error) throw error;
 
-      for (const pick of finalPicks) {
-        await insertPickHistoryIfMissing(pick);
-      }
-    }
+  await supabase.from("pick_history").insert(finalPicks);
+}
 
     res.json({
       success: true,
