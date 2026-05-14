@@ -277,26 +277,40 @@ function assignSections(picks) {
   });
 }
 
-function uniqueByGameAndTeam(picks) {
-  const seen = new Set();
-  const out = [];
+function uniqueByGameBestSide(picks) {
+  const gameMap = new Map();
 
   for (const p of picks) {
-    const key = [
+    const gameKey = [
       p.sport,
       toDateOnly(p.commence_time),
       normalizeTeam(p.home_team),
-      normalizeTeam(p.away_team),
-      normalizeTeam(p.team_name)
+      normalizeTeam(p.away_team)
     ].join("|");
 
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(p);
+    const existing = gameMap.get(gameKey);
+
+    if (!existing) {
+      gameMap.set(gameKey, p);
+      continue;
+    }
+
+    const currentScore =
+      Number(p.expected_value || 0) * 100 +
+      Number(p.edge || 0) * 2 +
+      Number(p.confidence || 0);
+
+    const existingScore =
+      Number(existing.expected_value || 0) * 100 +
+      Number(existing.edge || 0) * 2 +
+      Number(existing.confidence || 0);
+
+    if (currentScore > existingScore) {
+      gameMap.set(gameKey, p);
     }
   }
 
-  return out;
+  return Array.from(gameMap.values());
 }
 
 function smartbetGameWindowHours(sportKey) {
@@ -543,7 +557,7 @@ app.get("/scan", async (req, res) => {
       }
     }
 
-    const finalPicks = assignSections(uniqueByGameAndTeam(allPicks))
+    const finalPicks = assignSections(uniqueByGameBestSide(allPicks))
       .sort((a, b) => {
         const todayA = a.today_play ? 1 : 0;
         const todayB = b.today_play ? 1 : 0;
