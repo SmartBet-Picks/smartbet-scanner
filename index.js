@@ -764,7 +764,64 @@ app.get("/scan", async (req, res) => {
 });
 
 
+app.get("/scan-props", async (req, res) => {
+  try {
+    const payload = {
+      sport: "MLB",
+      game: "Demo Player Props",
+      pick: "Aaron Judge Over 1.5 Hits",
+      team_name: "Aaron Judge",
+      player_name: "Aaron Judge",
+      odds: -125,
+      confidence: 78.5,
+      edge: 18.2,
+      expected_value: 0.34,
+      market_confidence: "Balanced Market",
+      volatility: "Medium",
+      trap_warning: "None",
+      section: "Balanced Prop Slip",
+      bet_type: "player_prop",
+      prop_type: "Hits",
+      market: "Hits",
+      prop_market_key: "batter_hits",
+      over_under: "Over",
+      line: 1.5,
+      bookmaker: "DraftKings",
+      status: "Pending",
+      result: "Pending",
+      event_time_label: "Starts Tonight",
+      today_play: true,
+      early_value: false,
+      hours_until_game: 2.5,
+      commence_time: new Date().toISOString(),
+      game_date: new Date().toISOString().slice(0, 10),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
 
+    const { data, error } = await supabase
+      .from("picks")
+      .insert([payload])
+      .select();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Test prop inserted successfully.",
+      inserted: data?.length || 0,
+      props: data || [],
+      time: nowISO()
+    });
+
+  } catch (error) {
+    console.error("SCAN PROPS TEST ERROR:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 
 app.get("/debug-scores", async (req, res) => {
   try {
