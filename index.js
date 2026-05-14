@@ -16,6 +16,18 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
+if (!ODDS_API_KEY) {
+  console.error("Missing ODDS_API_KEY");
+}
+
+if (!SUPABASE_URL) {
+  console.error("Missing SUPABASE_URL");
+}
+
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY");
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const BOOKMAKER_KEY = "draftkings";
@@ -140,6 +152,7 @@ function getEventTimeLabel(hoursUntilGame) {
 
 function getTimingFlags(commenceTime) {
   const hoursUntilGame = getHoursUntilGame(commenceTime);
+
   const todayPlay =
     hoursUntilGame != null &&
     hoursUntilGame >= 0 &&
@@ -157,7 +170,7 @@ function getTimingFlags(commenceTime) {
   };
 }
 
-function confidenceEngineV2({ odds, homeTeam, teamName }) {
+function confidenceEngineV26({ odds, homeTeam, teamName }) {
   const implied = americanToImpliedProbability(odds);
   let confidence = 60;
 
@@ -176,7 +189,6 @@ function confidenceEngineV2({ odds, homeTeam, teamName }) {
 }
 
 function passesEVFilter(pick) {
-
   const odds = Number(pick.odds || 0);
   const confidence = Number(pick.confidence || 0);
   const edge = Number(pick.edge || 0);
@@ -185,61 +197,24 @@ function passesEVFilter(pick) {
   if (!Number.isFinite(odds)) return false;
   if (!Number.isFinite(confidence)) return false;
 
-  /*
-    CORE FILTERS
-  */
-
   if (confidence < 75) return false;
-
   if (edge < 5) return false;
-
   if (ev < 0.08) return false;
 
-  /*
-    FAVORITE CONTROL
-  */
-
   if (odds <= -220) return false;
-
   if (odds <= -180 && confidence < 80) return false;
-
-  /*
-    UNDERDOG CONTROL
-  */
 
   if (odds >= 160 && confidence < 80) return false;
 
-  /*
-    MLB TIGHTENING
-  */
-
-  if (
-    pick.sport === "MLB" &&
-    odds <= -170 &&
-    edge < 7
-  ) {
+  if (pick.sport === "MLB" && odds <= -170 && edge < 7) {
     return false;
   }
 
-  /*
-    VOLATILITY FILTER
-  */
-
-  if (
-    pick.volatility === "High" &&
-    confidence < 82
-  ) {
+  if (pick.volatility === "High" && confidence < 82) {
     return false;
   }
 
-  /*
-    TRAP WARNING FILTER
-  */
-
-  if (
-    pick.trap_warning &&
-    pick.trap_warning !== "None"
-  ) {
+  if (pick.trap_warning && pick.trap_warning !== "None") {
     return false;
   }
 
@@ -260,8 +235,9 @@ function assignSections(picks) {
   return sorted.map((pick, index) => {
     let section = "Aggressive Slip";
 
-    if (index < 5) section = "Top 5 Locks";
-    else if (
+    if (index < 5) {
+      section = "Top 5 Locks";
+    } else if (
       pick.confidence >= 76 &&
       pick.expected_value >= 0 &&
       pick.volatility !== "High"
@@ -393,7 +369,7 @@ async function fetchJson(url) {
 }
 
 async function insertPickHistoryIfMissing(pick) {
-  const { data: existing } = await supabase
+  const { data: existing, error } = await supabase
     .from("pick_history")
     .select("id")
     .eq("sport", pick.sport)
@@ -403,9 +379,20 @@ async function insertPickHistoryIfMissing(pick) {
     .eq("commence_time", pick.commence_time)
     .limit(1);
 
+  if (error) {
+    console.error("Pick history lookup error:", error.message);
+    return;
+  }
+
   if (existing && existing.length > 0) return;
 
-  await supabase.from("pick_history").insert([pick]);
+  const { error: insertError } = await supabase
+    .from("pick_history")
+    .insert([pick]);
+
+  if (insertError) {
+    console.error("Pick history insert error:", insertError.message);
+  }
 }
 
 app.get("/", (req, res) => {
@@ -414,7 +401,7 @@ app.get("/", (req, res) => {
     stack: "Shopify + Railway + Supabase + Odds API",
     bookmaker: "DraftKings only",
     market: "Moneyline",
-    engine: "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split",
+    engine: "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split + One Pick Per Game",
     routes: [
       "/",
       "/scan",
@@ -478,7 +465,7 @@ app.get("/scan", async (req, res) => {
 
           const impliedRaw = americanToImpliedProbability(odds);
 
-          const confidence = confidenceEngineV2({
+          const confidence = confidenceEngineV26({
             odds,
             homeTeam: game.home_team,
             teamName
@@ -557,7 +544,9 @@ app.get("/scan", async (req, res) => {
       }
     }
 
-    const finalPicks = assignSections(uniqueByGameBestSide(allPicks))
+    const bestSidePicks = uniqueByGameBestSide(allPicks);
+
+    const finalPicks = assignSections(bestSidePicks)
       .sort((a, b) => {
         const todayA = a.today_play ? 1 : 0;
         const todayB = b.today_play ? 1 : 0;
@@ -574,7 +563,12 @@ app.get("/scan", async (req, res) => {
       })
       .slice(0, 40);
 
-    await supabase.from("picks").delete().neq("id", 0);
+    const { error: deleteError } = await supabase
+      .from("picks")
+      .delete()
+      .neq("id", -1);
+
+    if (deleteError) throw deleteError;
 
     if (finalPicks.length > 0) {
       const { error } = await supabase.from("picks").insert(finalPicks);
@@ -587,11 +581,12 @@ app.get("/scan", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Clean EV scan complete with Today’s Top Plays + Early Value Plays",
+      message: "Clean EV scan complete with Today’s Top Plays + Early Value Plays + One Pick Per Game",
       filter_note:
-        "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays.",
+        "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays. One-pick-per-game logic prevents both sides from appearing.",
       bookmaker: "DraftKings",
       market: "Moneyline",
+      total_raw_picks_before_best_side_filter: allPicks.length,
       total_saved: finalPicks.length,
       today_top_plays_count: finalPicks.filter(p => p.today_play).length,
       early_value_plays_count: finalPicks.filter(p => p.early_value).length,
@@ -639,7 +634,10 @@ app.get("/grade", async (req, res) => {
         continue;
       }
 
-      const sportConfig = SPORTS.find(s => s.label === pick.sport || s.key === pick.sport_key);
+      const sportConfig = SPORTS.find(
+        s => s.label === pick.sport || s.key === pick.sport_key
+      );
+
       if (!sportConfig) {
         skipped.push({ id: pick.id, reason: "Unknown sport", game: pick.game });
         continue;
