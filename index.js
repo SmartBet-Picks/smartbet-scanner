@@ -120,43 +120,6 @@ function getTrapWarning({ odds, impliedProbability, confidence, edge, expectedVa
   return "None";
 }
 
-function getHoursUntilGame(commenceTime) {
-  if (!commenceTime) return null;
-  const gameTime = new Date(commenceTime);
-  if (Number.isNaN(gameTime.getTime())) return null;
-
-  const now = new Date();
-  const diffMs = gameTime.getTime() - now.getTime();
-  return Number((diffMs / (1000 * 60 * 60)).toFixed(2));
-}
-
-function getEventTimeLabel(hoursUntilGame) {
-  if (hoursUntilGame == null) return "Upcoming";
-  if (hoursUntilGame < 0) return "Started / Pending Grade";
-  if (hoursUntilGame <= 12) return "Starts Tonight";
-  if (hoursUntilGame <= 24) return "Starts Tomorrow";
-  return "Early Market Value";
-}
-
-function getTimingFlags(commenceTime) {
-  const hoursUntilGame = getHoursUntilGame(commenceTime);
-  const todayPlay =
-    hoursUntilGame != null &&
-    hoursUntilGame >= 0 &&
-    hoursUntilGame <= 24;
-
-  const earlyValue =
-    hoursUntilGame != null &&
-    hoursUntilGame > 24;
-
-  return {
-    today_play: todayPlay,
-    early_value: earlyValue,
-    hours_until_game: hoursUntilGame,
-    event_time_label: getEventTimeLabel(hoursUntilGame)
-  };
-}
-
 function confidenceEngineV2({ odds, homeTeam, teamName }) {
   const implied = americanToImpliedProbability(odds);
   let confidence = 60;
@@ -349,7 +312,7 @@ app.get("/", (req, res) => {
     stack: "Shopify + Railway + Supabase + Odds API",
     bookmaker: "DraftKings only",
     market: "Moneyline",
-    engine: "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split",
+    engine: "Confidence Engine V2.5 + EV Filter Phase 1",
     routes: [
       "/",
       "/scan",
@@ -432,8 +395,6 @@ app.get("/scan", async (req, res) => {
             expectedValue
           });
 
-          const timingFlags = getTimingFlags(game.commence_time);
-
           const pick = {
             sport: sport.label,
             sport_key: sport.key,
@@ -457,10 +418,6 @@ app.get("/scan", async (req, res) => {
             trap_warning: trapWarning,
             commence_time: game.commence_time,
             game_date: toDateOnly(game.commence_time),
-            today_play: timingFlags.today_play,
-            early_value: timingFlags.early_value,
-            hours_until_game: timingFlags.hours_until_game,
-            event_time_label: timingFlags.event_time_label,
             status: "Pending",
             result: "Pending",
             actual_result: null,
@@ -478,10 +435,6 @@ app.get("/scan", async (req, res) => {
               confidence: pick.confidence,
               edge: pick.edge,
               expected_value: pick.expected_value,
-              today_play: pick.today_play,
-              early_value: pick.early_value,
-              hours_until_game: pick.hours_until_game,
-              event_time_label: pick.event_time_label,
               reason: "Filtered out by EV/edge/favorite-trap rules"
             });
             continue;
@@ -494,11 +447,6 @@ app.get("/scan", async (req, res) => {
 
     const finalPicks = assignSections(uniqueByGameAndTeam(allPicks))
       .sort((a, b) => {
-        const todayA = a.today_play ? 1 : 0;
-        const todayB = b.today_play ? 1 : 0;
-
-        if (todayB - todayA !== 0) return todayB - todayA;
-
         const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
         if (evDiff !== 0) return evDiff;
 
@@ -522,22 +470,18 @@ app.get("/scan", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Clean EV scan complete with Today’s Top Plays + Early Value Plays",
+      message: "Clean EV scan complete",
       filter_note:
-        "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays.",
+        "NFL is enabled, but offseason/futures/far-future markets are blocked. EV filter now blocks weak favorites, negative EV, low edge, and low-confidence plays.",
       bookmaker: "DraftKings",
       market: "Moneyline",
       total_saved: finalPicks.length,
-      today_top_plays_count: finalPicks.filter(p => p.today_play).length,
-      early_value_plays_count: finalPicks.filter(p => p.early_value).length,
       skipped_games_count: skippedGames.length,
       ev_filtered_picks_count: filteredPicks.length,
       top_5_count: finalPicks.filter(p => p.section === "Top 5 Locks").length,
       free_pick_count: finalPicks.filter(p => p.section === "Free Pick").length,
       time: nowISO(),
       picks: finalPicks,
-      today_top_plays: finalPicks.filter(p => p.today_play),
-      early_value_plays: finalPicks.filter(p => p.early_value),
       skipped_games: skippedGames.slice(0, 25),
       ev_filtered_picks: filteredPicks.slice(0, 25)
     });
