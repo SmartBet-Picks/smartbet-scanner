@@ -31,24 +31,6 @@ const SPORTS = [
   { key: "mma_mixed_martial_arts", label: "UFC" }
 ];
 
-const PLAYER_PROP_MARKETS = {
-  baseball_mlb: ["batter_hits"],
-  basketball_nba: ["player_points"],
-  americanfootball_nfl: ["player_receptions"],
-  mma_mixed_martial_arts: ["fighter_significant_strikes"]
-};
-
-let propsScanRunning = false;
-let lastPropsScanStatus = {
-  running: false,
-  success: null,
-  message: "No props scan has run yet.",
-  total_props_saved: 0,
-  started_at: null,
-  finished_at: null,
-  error: null
-};
-
 function nowISO() {
   return new Date().toISOString();
 }
@@ -92,8 +74,13 @@ function calculateExpectedValue(odds, confidence) {
 
   if (!Number.isFinite(n) || !Number.isFinite(c)) return null;
 
-  const decimalOdds = n > 0 ? n / 100 + 1 : 100 / Math.abs(n) + 1;
+  const decimalOdds =
+    n > 0
+      ? n / 100 + 1
+      : 100 / Math.abs(n) + 1;
+
   const winProbability = c / 100;
+
   const expectedValue =
     winProbability * (decimalOdds - 1) - (1 - winProbability);
 
@@ -153,11 +140,18 @@ function getEventTimeLabel(hoursUntilGame) {
 
 function getTimingFlags(commenceTime) {
   const hoursUntilGame = getHoursUntilGame(commenceTime);
+  const todayPlay =
+    hoursUntilGame != null &&
+    hoursUntilGame >= 0 &&
+    hoursUntilGame <= 24;
+
+  const earlyValue =
+    hoursUntilGame != null &&
+    hoursUntilGame > 24;
 
   return {
-    today_play:
-      hoursUntilGame != null && hoursUntilGame >= 0 && hoursUntilGame <= 24,
-    early_value: hoursUntilGame != null && hoursUntilGame > 24,
+    today_play: todayPlay,
+    early_value: earlyValue,
     hours_until_game: hoursUntilGame,
     event_time_label: getEventTimeLabel(hoursUntilGame)
   };
@@ -320,56 +314,6 @@ function smartbetIsValidScannerGame(game, sportKey) {
   return true;
 }
 
-function normalizePropType(marketKey) {
-  const map = {
-    batter_hits: "Hits",
-    batter_total_bases: "Total Bases",
-    pitcher_strikeouts: "Strikeouts",
-    pitcher_hits_allowed: "Hits Allowed",
-    batter_rbis: "RBIs",
-    player_points: "Points",
-    player_rebounds: "Rebounds",
-    player_assists: "Assists",
-    player_threes: "3PT Made",
-    player_points_rebounds_assists: "PRA",
-    player_pass_yds: "Passing Yards",
-    player_rush_yds: "Rushing Yards",
-    player_reception_yds: "Receiving Yards",
-    player_receptions: "Receptions",
-    player_anytime_td: "Anytime TD",
-    fighter_significant_strikes: "Significant Strikes",
-    fighter_takedowns: "Takedowns",
-    fight_goes_distance: "Fight Goes Distance",
-    fighter_fantasy_score: "Fantasy Score"
-  };
-
-  return map[marketKey] || marketKey;
-}
-
-function propConfidence({ odds, marketKey, overUnder }) {
-  const implied = americanToImpliedProbability(odds);
-  let confidence = 66;
-
-  if (implied != null) confidence += implied * 17;
-  if (odds < 0) confidence += 3;
-  if (odds <= -150) confidence += 2;
-  if (odds <= -220) confidence -= 8;
-  if (odds >= 130) confidence -= 4;
-  if (odds >= 170) confidence -= 7;
-  if (String(overUnder || "").toLowerCase() === "under") confidence += 1;
-  if (String(marketKey || "").includes("anytime_td")) confidence -= 6;
-
-  confidence = Math.max(50, Math.min(91, confidence));
-  return Number(confidence.toFixed(1));
-}
-
-function propVolatility(marketKey, odds) {
-  if (String(marketKey || "").includes("anytime_td")) return "High";
-  if (Number(odds) >= 170) return "High";
-  if (Number(odds) >= 120) return "Medium-High";
-  return "Medium";
-}
-
 async function fetchJson(url) {
   const res = await fetch(url);
   const text = await res.text();
@@ -399,263 +343,17 @@ async function insertPickHistoryIfMissing(pick) {
   await supabase.from("pick_history").insert([pick]);
 }
 
-async function insertPropHistoryIfMissing(prop) {
-  const { data: existing } = await supabase
-    .from("pick_history")
-    .select("id")
-    .eq("bet_type", "player_prop")
-    .eq("prop_id", prop.prop_id)
-    .limit(1);
-
-  if (existing && existing.length > 0) return;
-
-  await supabase.from("pick_history").insert([prop]);
-}
-
-async function runPropsScanInBackground() {
-  if (propsScanRunning) return;
-
-  propsScanRunning = true;
-  lastPropsScanStatus = {
-    running: true,
-    success: null,
-    message: "Props scan running in background.",
-    total_props_saved: 0,
-    started_at: nowISO(),
-    finished_at: null,
-    error: null
-  };
-
-  try {
-    const allProps = [];
-    const maxSports = 2;
-    const maxGamesPerSport = 1;
-    const maxFinalProps = 12;
-
-    for (const sport of SPORTS.slice(0, maxSports)) {
-      const markets = PLAYER_PROP_MARKETS[sport.key] || [];
-      if (!markets.length) continue;
-
-      const gamesUrl =
-        `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
-        `?apiKey=${ODDS_API_KEY}` +
-        `&regions=${REGIONS}` +
-        `&markets=h2h` +
-        `&oddsFormat=${ODDS_FORMAT}` +
-        `&bookmakers=${BOOKMAKER_KEY}`;
-
-      let games = [];
-
-      try {
-        games = await fetchJson(gamesUrl);
-      } catch (err) {
-        console.error("PROPS GAMES FETCH ERROR:", sport.label, err.message);
-        continue;
-      }
-
-      const validGames = (games || [])
-        .filter(game => smartbetIsValidScannerGame(game, sport.key))
-        .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time))
-        .slice(0, maxGamesPerSport);
-
-      for (const game of validGames) {
-        const eventId = game.id;
-        if (!eventId) continue;
-
-        const propsUrl =
-          `https://api.the-odds-api.com/v4/sports/${sport.key}/events/${eventId}/odds` +
-          `?apiKey=${ODDS_API_KEY}` +
-          `&regions=${REGIONS}` +
-          `&markets=${markets.join(",")}` +
-          `&oddsFormat=${ODDS_FORMAT}` +
-          `&bookmakers=${BOOKMAKER_KEY}`;
-
-        let eventProps = null;
-
-        try {
-          eventProps = await fetchJson(propsUrl);
-        } catch (err) {
-          console.error("PROPS EVENT FETCH ERROR:", game.away_team, game.home_team, err.message);
-          continue;
-        }
-
-        const bookmaker = (eventProps.bookmakers || []).find(
-          b => b.key === BOOKMAKER_KEY
-        );
-
-        if (!bookmaker) continue;
-
-        for (const market of bookmaker.markets || []) {
-          for (const outcome of market.outcomes || []) {
-            const odds = Number(outcome.price);
-            if (!Number.isFinite(odds)) continue;
-
-            const playerName = outcome.description || outcome.name || "Unknown Player";
-            const overUnder = outcome.name || null;
-            const line =
-              outcome.point !== undefined && outcome.point !== null
-                ? Number(outcome.point)
-                : null;
-
-            const impliedRaw = americanToImpliedProbability(odds);
-            const confidence = propConfidence({
-              odds,
-              marketKey: market.key,
-              overUnder
-            });
-
-            const edge = calculateEdge(impliedRaw, confidence);
-            const expectedValue = calculateExpectedValue(odds, confidence);
-            const volatility = propVolatility(market.key, odds);
-
-            if (confidence < 70) continue;
-            if (edge == null || edge < 3) continue;
-            if (expectedValue == null || expectedValue < 0) continue;
-
-            const timingFlags = getTimingFlags(game.commence_time);
-
-            const prop = {
-              sport: sport.label,
-              sport_key: sport.key,
-              event_id: eventId,
-              game: `${game.away_team} @ ${game.home_team}`,
-              home_team: game.home_team,
-              away_team: game.away_team,
-              team_name: playerName,
-              pick: `${playerName} ${overUnder || ""} ${line || ""} ${normalizePropType(market.key)}`.trim(),
-              market: normalizePropType(market.key),
-              bookmaker: "DraftKings",
-              bet_type: "player_prop",
-              prop_type: normalizePropType(market.key),
-              player_name: playerName,
-              line,
-              over_under: overUnder,
-              prop_result_value: null,
-              prop_market_key: market.key,
-              prop_id: [eventId, playerName, market.key, overUnder, line].join("|"),
-              odds,
-              implied_probability:
-                impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
-              confidence,
-              edge,
-              expected_value: expectedValue,
-              risk:
-                volatility === "High"
-                  ? "High"
-                  : confidence >= 80
-                    ? "Low"
-                    : "Medium",
-              market_confidence: getMarketConfidence(impliedRaw, odds),
-              volatility,
-              trap_warning: getTrapWarning({
-                odds,
-                impliedProbability: impliedRaw,
-                confidence,
-                edge,
-                expectedValue
-              }),
-              commence_time: game.commence_time,
-              game_date: toDateOnly(game.commence_time),
-              today_play: timingFlags.today_play,
-              early_value: timingFlags.early_value,
-              hours_until_game: timingFlags.hours_until_game,
-              event_time_label: timingFlags.event_time_label,
-              section: "Balanced Prop Slip",
-              status: "Pending",
-              result: "Pending",
-              actual_result: null,
-              graded_at: null,
-              created_at: nowISO(),
-              updated_at: nowISO()
-            };
-
-            allProps.push(prop);
-          }
-        }
-      }
-    }
-
-    const seen = new Set();
-    const finalProps = allProps
-      .filter(prop => {
-        if (seen.has(prop.prop_id)) return false;
-        seen.add(prop.prop_id);
-        return true;
-      })
-      .sort((a, b) => {
-        const todayDiff = Number(b.today_play) - Number(a.today_play);
-        if (todayDiff !== 0) return todayDiff;
-
-        const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
-        if (evDiff !== 0) return evDiff;
-
-        return Number(b.confidence || 0) - Number(a.confidence || 0);
-      })
-      .slice(0, maxFinalProps)
-      .map((prop, index) => {
-        let section = "Aggressive Prop Slip";
-        if (index === 0) section = "Free Prop Pick";
-        else if (index < 5) section = "Top 5 Props";
-        else if (prop.confidence >= 80 && prop.volatility !== "High") {
-          section = "Safe Prop Slip";
-        } else if (prop.confidence >= 73) {
-          section = "Balanced Prop Slip";
-        }
-        return { ...prop, section };
-      });
-
-    await supabase.from("picks").delete().eq("bet_type", "player_prop");
-
-    if (finalProps.length > 0) {
-      const { error } = await supabase.from("picks").insert(finalProps);
-      if (error) throw error;
-
-      for (const prop of finalProps) {
-        await insertPropHistoryIfMissing(prop);
-      }
-    }
-
-    lastPropsScanStatus = {
-      running: false,
-      success: true,
-      message: "Props scan complete.",
-      total_props_saved: finalProps.length,
-      started_at: lastPropsScanStatus.started_at,
-      finished_at: nowISO(),
-      error: null
-    };
-  } catch (error) {
-    console.error("BACKGROUND PROPS SCAN ERROR:", error);
-
-    lastPropsScanStatus = {
-      running: false,
-      success: false,
-      message: "Props scan failed.",
-      total_props_saved: 0,
-      started_at: lastPropsScanStatus.started_at,
-      finished_at: nowISO(),
-      error: error.message
-    };
-  } finally {
-    propsScanRunning = false;
-  }
-}
-
 app.get("/", (req, res) => {
   res.json({
     status: "SmartBet Railway backend running",
     stack: "Shopify + Railway + Supabase + Odds API",
     bookmaker: "DraftKings only",
-    market: "Moneyline + Player Props",
+    market: "Moneyline",
     engine: "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split",
     routes: [
       "/",
       "/scan",
-      "/scan-props",
-      "/debug-props",
-      "/props-scan-status",
       "/grade",
-      "/grade-props",
       "/results-summary",
       "/analytics-summary",
       "/trend-summary",
@@ -768,15 +466,7 @@ app.get("/scan", async (req, res) => {
             actual_result: null,
             graded_at: null,
             created_at: nowISO(),
-            updated_at: nowISO(),
-            bet_type: "moneyline",
-            prop_type: null,
-            player_name: null,
-            line: null,
-            over_under: null,
-            prop_result_value: null,
-            prop_market_key: null,
-            prop_id: null
+            updated_at: nowISO()
           };
 
           if (!passesEVFilter(pick)) {
@@ -819,10 +509,7 @@ app.get("/scan", async (req, res) => {
       })
       .slice(0, 40);
 
-    await supabase
-      .from("picks")
-      .delete()
-      .or("bet_type.is.null,bet_type.eq.moneyline");
+    await supabase.from("picks").delete().neq("id", 0);
 
     if (finalPicks.length > 0) {
       const { error } = await supabase.from("picks").insert(finalPicks);
@@ -837,7 +524,7 @@ app.get("/scan", async (req, res) => {
       success: true,
       message: "Clean EV scan complete with Today’s Top Plays + Early Value Plays",
       filter_note:
-        "Moneyline scan now preserves player props. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays.",
+        "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays.",
       bookmaker: "DraftKings",
       market: "Moneyline",
       total_saved: finalPicks.length,
@@ -860,172 +547,6 @@ app.get("/scan", async (req, res) => {
   }
 });
 
-app.get("/scan-props", async (req, res) => {
-  if (propsScanRunning) {
-    return res.json({
-      success: true,
-      message: "Props scan is already running.",
-      status: lastPropsScanStatus,
-      time: nowISO()
-    });
-  }
-
-  setImmediate(() => {
-    runPropsScanInBackground();
-  });
-
-  res.json({
-    success: true,
-    message: "Props scan started in the background. Check /props-scan-status or /debug-props in 30-60 seconds.",
-    status_route: "/props-scan-status",
-    debug_route: "/debug-props",
-    time: nowISO()
-  });
-});
-
-app.get("/props-scan-status", (req, res) => {
-  res.json({
-    success: true,
-    status: lastPropsScanStatus,
-    time: nowISO()
-  });
-});
-
-app.get("/debug-props", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("picks")
-      .select("*")
-      .eq("bet_type", "player_prop")
-      .order("created_at", { ascending: false })
-      .limit(100);
-
-    if (error) throw error;
-
-    res.json({
-      success: true,
-      props_count: data?.length || 0,
-      props: data || [],
-      scan_status: lastPropsScanStatus,
-      time: nowISO()
-    });
-  } catch (error) {
-    console.error("DEBUG PROPS ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/grade-props", async (req, res) => {
-  try {
-    const { data: pending, error } = await supabase
-      .from("pick_history")
-      .select("*")
-      .eq("bet_type", "player_prop")
-      .or("status.eq.Pending,result.eq.Pending");
-
-    if (error) throw error;
-
-    const graded = [];
-    const skipped = [];
-
-    for (const prop of pending || []) {
-      const commence = prop.commence_time ? new Date(prop.commence_time) : null;
-
-      if (commence && commence > new Date()) {
-        skipped.push({
-          id: prop.id,
-          reason: "Future event - not graded early",
-          prop: prop.pick
-        });
-        continue;
-      }
-
-      const { data: results, error: resultError } = await supabase
-        .from("prop_results")
-        .select("*")
-        .eq("event_id", prop.event_id)
-        .eq("player_name", prop.player_name)
-        .eq("market_key", prop.prop_market_key)
-        .limit(1);
-
-      if (resultError) throw resultError;
-
-      if (!results || results.length === 0) {
-        skipped.push({
-          id: prop.id,
-          reason: "No prop result found in prop_results",
-          prop: prop.pick
-        });
-        continue;
-      }
-
-      const actualStat = Number(results[0].actual_stat);
-      const line = Number(prop.line);
-
-      if (!Number.isFinite(actualStat) || !Number.isFinite(line)) {
-        skipped.push({
-          id: prop.id,
-          reason: "Missing actual stat or prop line",
-          prop: prop.pick
-        });
-        continue;
-      }
-
-      let result = "Push";
-
-      if (String(prop.over_under || "").toLowerCase() === "over") {
-        if (actualStat > line) result = "Win";
-        if (actualStat < line) result = "Loss";
-      } else if (String(prop.over_under || "").toLowerCase() === "under") {
-        if (actualStat < line) result = "Win";
-        if (actualStat > line) result = "Loss";
-      }
-
-      const updatePayload = {
-        status: result,
-        result,
-        actual_result: `${actualStat}`,
-        prop_result_value: actualStat,
-        graded_at: nowISO(),
-        updated_at: nowISO()
-      };
-
-      const { error: updateError } = await supabase
-        .from("pick_history")
-        .update(updatePayload)
-        .eq("id", prop.id);
-
-      if (updateError) throw updateError;
-
-      await supabase
-        .from("picks")
-        .update(updatePayload)
-        .eq("bet_type", "player_prop")
-        .eq("prop_id", prop.prop_id);
-
-      graded.push({
-        id: prop.id,
-        prop: prop.pick,
-        result,
-        actual_result: actualStat
-      });
-    }
-
-    res.json({
-      success: true,
-      message: "Prop grading complete",
-      graded_count: graded.length,
-      skipped_count: skipped.length,
-      graded,
-      skipped,
-      time: nowISO()
-    });
-  } catch (error) {
-    console.error("GRADE PROPS ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 app.get("/grade", async (req, res) => {
   try {
     const { data: pending, error } = await supabase
@@ -1041,15 +562,6 @@ app.get("/grade", async (req, res) => {
     const skipped = [];
 
     for (const pick of pending || []) {
-      if (pick.bet_type === "player_prop") {
-        skipped.push({
-          id: pick.id,
-          reason: "Player prop skipped by moneyline grader",
-          game: pick.game
-        });
-        continue;
-      }
-
       const commence = new Date(pick.commence_time);
 
       if (commence > now) {
@@ -1200,9 +712,7 @@ app.get("/results-summary", async (req, res) => {
         p.game_date || toDateOnly(p.commence_time),
         normalizeTeam(p.home_team),
         normalizeTeam(p.away_team),
-        normalizeTeam(p.team_name),
-        p.bet_type || "moneyline",
-        p.prop_id || ""
+        normalizeTeam(p.team_name)
       ].join("|");
 
       if (!seen.has(key)) {
