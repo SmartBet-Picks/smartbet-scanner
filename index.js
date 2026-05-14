@@ -16,18 +16,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
-if (!ODDS_API_KEY) {
-  console.error("Missing ODDS_API_KEY");
-}
-
-if (!SUPABASE_URL) {
-  console.error("Missing SUPABASE_URL");
-}
-
-if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY");
-}
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const BOOKMAKER_KEY = "draftkings";
@@ -86,11 +74,7 @@ function calculateExpectedValue(odds, confidence) {
 
   if (!Number.isFinite(n) || !Number.isFinite(c)) return null;
 
-  const decimalOdds =
-    n > 0
-      ? n / 100 + 1
-      : 100 / Math.abs(n) + 1;
-
+  const decimalOdds = n > 0 ? n / 100 + 1 : 100 / Math.abs(n) + 1;
   const winProbability = c / 100;
 
   const expectedValue =
@@ -134,11 +118,11 @@ function getTrapWarning({ odds, impliedProbability, confidence, edge, expectedVa
 
 function getHoursUntilGame(commenceTime) {
   if (!commenceTime) return null;
+
   const gameTime = new Date(commenceTime);
   if (Number.isNaN(gameTime.getTime())) return null;
 
-  const now = new Date();
-  const diffMs = gameTime.getTime() - now.getTime();
+  const diffMs = gameTime.getTime() - Date.now();
   return Number((diffMs / (1000 * 60 * 60)).toFixed(2));
 }
 
@@ -153,18 +137,16 @@ function getEventTimeLabel(hoursUntilGame) {
 function getTimingFlags(commenceTime) {
   const hoursUntilGame = getHoursUntilGame(commenceTime);
 
-  const todayPlay =
-    hoursUntilGame != null &&
-    hoursUntilGame >= 0 &&
-    hoursUntilGame <= 24;
-
-  const earlyValue =
-    hoursUntilGame != null &&
-    hoursUntilGame > 24;
-
   return {
-    today_play: todayPlay,
-    early_value: earlyValue,
+    today_play:
+      hoursUntilGame != null &&
+      hoursUntilGame >= 0 &&
+      hoursUntilGame <= 24,
+
+    early_value:
+      hoursUntilGame != null &&
+      hoursUntilGame > 24,
+
     hours_until_game: hoursUntilGame,
     event_time_label: getEventTimeLabel(hoursUntilGame)
   };
@@ -175,9 +157,11 @@ function confidenceEngineV26({ odds, homeTeam, teamName }) {
   let confidence = 60;
 
   if (implied != null) confidence += Math.min(18, implied * 20);
+
   if (odds < 0) confidence += 5;
   if (odds <= -160) confidence += 3;
   if (odds <= -260) confidence -= 8;
+
   if (odds >= 120) confidence -= 3;
   if (odds >= 180) confidence -= 6;
 
@@ -203,7 +187,6 @@ function passesEVFilter(pick) {
 
   if (odds <= -220) return false;
   if (odds <= -180 && confidence < 80) return false;
-
   if (odds >= 160 && confidence < 80) return false;
 
   if (pick.sport === "MLB" && odds <= -170 && edge < 7) {
@@ -219,6 +202,35 @@ function passesEVFilter(pick) {
   }
 
   return true;
+}
+
+function scorePick(pick) {
+  return (
+    Number(pick.expected_value || 0) * 100 +
+    Number(pick.edge || 0) * 2 +
+    Number(pick.confidence || 0)
+  );
+}
+
+function uniqueByGameBestSide(picks) {
+  const gameMap = new Map();
+
+  for (const p of picks) {
+    const gameKey = [
+      p.sport,
+      toDateOnly(p.commence_time),
+      normalizeTeam(p.home_team),
+      normalizeTeam(p.away_team)
+    ].join("|");
+
+    const existing = gameMap.get(gameKey);
+
+    if (!existing || scorePick(p) > scorePick(existing)) {
+      gameMap.set(gameKey, p);
+    }
+  }
+
+  return Array.from(gameMap.values());
 }
 
 function assignSections(picks) {
@@ -251,42 +263,6 @@ function assignSections(picks) {
 
     return { ...pick, section };
   });
-}
-
-function uniqueByGameBestSide(picks) {
-  const gameMap = new Map();
-
-  for (const p of picks) {
-    const gameKey = [
-      p.sport,
-      toDateOnly(p.commence_time),
-      normalizeTeam(p.home_team),
-      normalizeTeam(p.away_team)
-    ].join("|");
-
-    const existing = gameMap.get(gameKey);
-
-    if (!existing) {
-      gameMap.set(gameKey, p);
-      continue;
-    }
-
-    const currentScore =
-      Number(p.expected_value || 0) * 100 +
-      Number(p.edge || 0) * 2 +
-      Number(p.confidence || 0);
-
-    const existingScore =
-      Number(existing.expected_value || 0) * 100 +
-      Number(existing.edge || 0) * 2 +
-      Number(existing.confidence || 0);
-
-    if (currentScore > existingScore) {
-      gameMap.set(gameKey, p);
-    }
-  }
-
-  return Array.from(gameMap.values());
 }
 
 function smartbetGameWindowHours(sportKey) {
@@ -348,7 +324,10 @@ function smartbetIsValidScannerGame(game, sportKey) {
   if (gameTime < minTime) return false;
   if (gameTime > maxTime) return false;
 
-  if (sportKey === "americanfootball_nfl" && !smartbetIsNFLInPlayableWindow(gameTime)) {
+  if (
+    sportKey === "americanfootball_nfl" &&
+    !smartbetIsNFLInPlayableWindow(gameTime)
+  ) {
     return false;
   }
 
@@ -401,7 +380,8 @@ app.get("/", (req, res) => {
     stack: "Shopify + Railway + Supabase + Odds API",
     bookmaker: "DraftKings only",
     market: "Moneyline",
-    engine: "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split + One Pick Per Game",
+    engine:
+      "Confidence Engine V2.6 + EV Filter Phase 1 + Today/Early Value Split + One Pick Per Game",
     routes: [
       "/",
       "/scan",
@@ -439,12 +419,16 @@ app.get("/scan", async (req, res) => {
             sport: sport.label,
             game: `${game?.away_team || "Unknown"} @ ${game?.home_team || "Unknown"}`,
             commence_time: game?.commence_time || null,
-            reason: "Filtered out: offseason, old, far-future, missing teams, or futures-style market"
+            reason:
+              "Filtered out: offseason, old, far-future, missing teams, or futures-style market"
           });
           continue;
         }
 
-        const bookmaker = (game.bookmakers || []).find(b => b.key === BOOKMAKER_KEY);
+        const bookmaker = (game.bookmakers || []).find(
+          b => b.key === BOOKMAKER_KEY
+        );
+
         if (!bookmaker) continue;
 
         const market = (bookmaker.markets || []).find(m => m.key === MARKETS);
@@ -544,9 +528,9 @@ app.get("/scan", async (req, res) => {
       }
     }
 
-    const bestSidePicks = uniqueByGameBestSide(allPicks);
+    const onePickPerGame = uniqueByGameBestSide(allPicks);
 
-    const finalPicks = assignSections(bestSidePicks)
+    const finalPicks = assignSections(onePickPerGame)
       .sort((a, b) => {
         const todayA = a.today_play ? 1 : 0;
         const todayB = b.today_play ? 1 : 0;
@@ -563,12 +547,7 @@ app.get("/scan", async (req, res) => {
       })
       .slice(0, 40);
 
-    const { error: deleteError } = await supabase
-      .from("picks")
-      .delete()
-      .neq("id", -1);
-
-    if (deleteError) throw deleteError;
+    await supabase.from("picks").delete().neq("id", 0);
 
     if (finalPicks.length > 0) {
       const { error } = await supabase.from("picks").insert(finalPicks);
@@ -581,7 +560,8 @@ app.get("/scan", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Clean EV scan complete with Today’s Top Plays + Early Value Plays + One Pick Per Game",
+      message:
+        "Clean EV scan complete with Today’s Top Plays + Early Value Plays + One Pick Per Game",
       filter_note:
         "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays. One-pick-per-game logic prevents both sides from appearing.",
       bookmaker: "DraftKings",
@@ -639,7 +619,11 @@ app.get("/grade", async (req, res) => {
       );
 
       if (!sportConfig) {
-        skipped.push({ id: pick.id, reason: "Unknown sport", game: pick.game });
+        skipped.push({
+          id: pick.id,
+          reason: "Unknown sport",
+          game: pick.game
+        });
         continue;
       }
 
@@ -653,8 +637,11 @@ app.get("/grade", async (req, res) => {
 
       const match = (scores || []).find(game => {
         const sameDate = toDateOnly(game.commence_time) === pickDate;
-        const sameHome = normalizeTeam(game.home_team) === normalizeTeam(pick.home_team);
-        const sameAway = normalizeTeam(game.away_team) === normalizeTeam(pick.away_team);
+        const sameHome =
+          normalizeTeam(game.home_team) === normalizeTeam(pick.home_team);
+        const sameAway =
+          normalizeTeam(game.away_team) === normalizeTeam(pick.away_team);
+
         return sameDate && sameHome && sameAway;
       });
 
@@ -679,8 +666,13 @@ app.get("/grade", async (req, res) => {
       }
 
       const scoresArr = match.scores || [];
+
       if (scoresArr.length < 2) {
-        skipped.push({ id: pick.id, reason: "Scores missing", game: pick.game });
+        skipped.push({
+          id: pick.id,
+          reason: "Scores missing",
+          game: pick.game
+        });
         continue;
       }
 
@@ -693,7 +685,11 @@ app.get("/grade", async (req, res) => {
       );
 
       if (!teamScore || !opponentScore) {
-        skipped.push({ id: pick.id, reason: "Team score not matched", game: pick.game });
+        skipped.push({
+          id: pick.id,
+          reason: "Team score not matched",
+          game: pick.game
+        });
         continue;
       }
 
@@ -701,12 +697,18 @@ app.get("/grade", async (req, res) => {
       const oppPoints = Number(opponentScore.score);
 
       if (!Number.isFinite(teamPoints) || !Number.isFinite(oppPoints)) {
-        skipped.push({ id: pick.id, reason: "Invalid score values", game: pick.game });
+        skipped.push({
+          id: pick.id,
+          reason: "Invalid score values",
+          game: pick.game
+        });
         continue;
       }
 
       const won = teamPoints > oppPoints;
-      const actualResult = `${teamScore.name} ${teamPoints} - ${opponentScore.name} ${oppPoints}`;
+
+      const actualResult =
+        `${teamScore.name} ${teamPoints} - ${opponentScore.name} ${oppPoints}`;
 
       const updatePayload = {
         status: won ? "Win" : "Loss",
@@ -794,8 +796,12 @@ app.get("/results-summary", async (req, res) => {
     const wins = unique.filter(p => p.result === "Win").length;
     const losses = unique.filter(p => p.result === "Loss").length;
     const total = wins + losses;
-    const winRate = total ? Number(((wins / total) * 100).toFixed(1)) : 0;
-    const roi = total ? Number(((profit / (total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
+
+    const winRate =
+      total ? Number(((wins / total) * 100).toFixed(1)) : 0;
+
+    const roi =
+      total ? Number(((profit / (total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
 
     res.json({
       success: true,
@@ -879,16 +885,30 @@ app.get("/analytics-summary", async (req, res) => {
 
     for (const key of Object.keys(sectionAnalytics)) {
       const x = sectionAnalytics[key];
-      x.win_rate = x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
+
+      x.win_rate =
+        x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
+
       x.profit = Number(x.profit.toFixed(2));
-      x.roi = x.total ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
+
+      x.roi =
+        x.total
+          ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1))
+          : 0;
     }
 
     for (const key of Object.keys(sportAnalytics)) {
       const x = sportAnalytics[key];
-      x.win_rate = x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
+
+      x.win_rate =
+        x.total ? Number(((x.wins / x.total) * 100).toFixed(1)) : 0;
+
       x.profit = Number(x.profit.toFixed(2));
-      x.roi = x.total ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0;
+
+      x.roi =
+        x.total
+          ? Number(((x.profit / (x.total * DEFAULT_STAKE)) * 100).toFixed(1))
+          : 0;
     }
 
     res.json({
@@ -960,26 +980,43 @@ app.get("/trend-summary", async (req, res) => {
 
     const teams = Object.values(teamMap).map(t => ({
       ...t,
-      win_rate: t.total ? Number(((t.wins / t.total) * 100).toFixed(1)) : 0,
+      win_rate:
+        t.total ? Number(((t.wins / t.total) * 100).toFixed(1)) : 0,
       profit: Number(t.profit.toFixed(2)),
-      roi: t.total ? Number(((t.profit / (t.total * DEFAULT_STAKE)) * 100).toFixed(1)) : 0
+      roi:
+        t.total
+          ? Number(((t.profit / (t.total * DEFAULT_STAKE)) * 100).toFixed(1))
+          : 0
     }));
 
     const hottestTeams = teams
       .filter(t => t.total >= 2)
-      .sort((a, b) => b.roi - a.roi || b.win_rate - a.win_rate || b.wins - a.wins)
+      .sort(
+        (a, b) =>
+          b.roi - a.roi ||
+          b.win_rate - a.win_rate ||
+          b.wins - a.wins
+      )
       .slice(0, 10);
 
     const coldFadeTeams = teams
       .filter(t => t.total >= 2)
-      .sort((a, b) => a.roi - b.roi || a.win_rate - b.win_rate || b.losses - a.losses)
+      .sort(
+        (a, b) =>
+          a.roi - b.roi ||
+          a.win_rate - b.win_rate ||
+          b.losses - a.losses
+      )
       .slice(0, 10);
 
     const sharpestRecentPicks = (data || [])
       .filter(p => p.result === "Win")
       .sort((a, b) => {
-        const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
+        const evDiff =
+          Number(b.expected_value || 0) - Number(a.expected_value || 0);
+
         if (evDiff !== 0) return evDiff;
+
         return Number(b.edge || 0) - Number(a.edge || 0);
       })
       .slice(0, 10);
