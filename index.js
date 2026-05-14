@@ -520,8 +520,10 @@ app.get("/scan", async (req, res) => {
       })
       .slice(0, 40);
 
-    await supabase.from("picks").delete().neq("id", 0);
-
+    await supabase
+  .from("picks")
+  .delete()
+  .or("bet_type.is.null,bet_type.eq.moneyline");
     if (finalPicks.length > 0) {
       const { error } = await supabase.from("picks").insert(finalPicks);
       if (error) throw error;
