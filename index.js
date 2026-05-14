@@ -282,11 +282,11 @@ function uniqueByGameBestSide(picks) {
 
   for (const p of picks) {
     const gameKey = [
-  p.sport,
-  toDateOnly(p.commence_time),
-  normalizeTeam(p.home_team),
-  normalizeTeam(p.away_team)
-].join("|");
+      p.sport,
+      toDateOnly(p.commence_time),
+      normalizeTeam(p.home_team),
+      normalizeTeam(p.away_team)
+    ].join("|");
 
     const existing = gameMap.get(gameKey);
 
