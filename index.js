@@ -48,6 +48,64 @@ function normalizeTeam(name) {
     .trim();
 }
 
+function historyDedupeKey(pick) {
+  return [
+    pick.sport || "",
+    normalizeTeam(pick.team_name || pick.pick),
+    normalizeTeam(pick.home_team),
+    normalizeTeam(pick.away_team),
+    pick.commence_time || ""
+  ].join("|");
+}
+
+function pickHistorySortTime(pick) {
+  const graded = pick.graded_at ? new Date(pick.graded_at).getTime() : 0;
+  const updated = pick.updated_at ? new Date(pick.updated_at).getTime() : 0;
+  const created = pick.created_at ? new Date(pick.created_at).getTime() : 0;
+  return Math.max(graded || 0, updated || 0, created || 0);
+}
+
+function isGradedPick(pick) {
+  return pick && ["Win", "Loss"].includes(pick.result);
+}
+
+function preferHistoryRow(candidate, existing) {
+  if (!existing) return candidate;
+
+  const candidateGraded = isGradedPick(candidate) ? 1 : 0;
+  const existingGraded = isGradedPick(existing) ? 1 : 0;
+
+  if (candidateGraded !== existingGraded) {
+    return candidateGraded > existingGraded ? candidate : existing;
+  }
+
+  const candidateTime = pickHistorySortTime(candidate);
+  const existingTime = pickHistorySortTime(existing);
+
+  if (candidateTime !== existingTime) {
+    return candidateTime > existingTime ? candidate : existing;
+  }
+
+  const candidateId = Number(candidate.id || 0);
+  const existingId = Number(existing.id || 0);
+
+  return candidateId > existingId ? candidate : existing;
+}
+
+function dedupePickHistoryRows(rows) {
+  const map = new Map();
+
+  for (const row of rows || []) {
+    const key = historyDedupeKey(row);
+    const existing = map.get(key);
+    map.set(key, preferHistoryRow(row, existing));
+  }
+
+  return Array.from(map.values()).sort((a, b) => {
+    return pickHistorySortTime(b) - pickHistorySortTime(a);
+  });
+}
+
 function americanToImpliedProbability(odds) {
   const n = Number(odds);
   if (!Number.isFinite(n) || n === 0) return null;
@@ -370,6 +428,7 @@ async function insertPickHistoryIfMissing(pick) {
     .insert([pick]);
 
   if (insertError) {
+    if (insertError.code === "23505") return;
     console.error("Pick history insert error:", insertError.message);
   }
 }
@@ -589,7 +648,7 @@ app.get("/scan", async (req, res) => {
 
 app.get("/grade", async (req, res) => {
   try {
-    const { data: pending, error } = await supabase
+    const { data: pendingRows, error } = await supabase
       .from("pick_history")
       .select("*")
       .or("status.eq.Pending,result.eq.Pending")
@@ -597,6 +656,7 @@ app.get("/grade", async (req, res) => {
 
     if (error) throw error;
 
+    const pending = dedupePickHistoryRows(pendingRows || []);
     const now = new Date();
     const graded = [];
     const skipped = [];
@@ -747,6 +807,8 @@ app.get("/grade", async (req, res) => {
       message: "Grading complete",
       graded_count: graded.length,
       skipped_count: skipped.length,
+      deduped_pending_count: pending.length,
+      raw_pending_count: pendingRows?.length || 0,
       graded,
       skipped,
       time: nowISO()
@@ -768,23 +830,7 @@ app.get("/results-summary", async (req, res) => {
 
     if (error) throw error;
 
-    const unique = [];
-    const seen = new Set();
-
-    for (const p of data || []) {
-      const key = [
-        p.sport,
-        p.game_date || toDateOnly(p.commence_time),
-        normalizeTeam(p.home_team),
-        normalizeTeam(p.away_team),
-        normalizeTeam(p.team_name)
-      ].join("|");
-
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(p);
-      }
-    }
+    const unique = dedupePickHistoryRows(data || []);
 
     let profit = 0;
 
@@ -811,6 +857,8 @@ app.get("/results-summary", async (req, res) => {
       win_rate: winRate,
       profit: Number(profit.toFixed(2)),
       roi,
+      raw_rows_checked: data?.length || 0,
+      deduped_rows_used: unique.length,
       recent_results: unique.slice(0, 50),
       last_updated: nowISO()
     });
@@ -831,10 +879,11 @@ app.get("/analytics-summary", async (req, res) => {
 
     if (error) throw error;
 
+    const unique = dedupePickHistoryRows(data || []);
     const sectionAnalytics = {};
     const sportAnalytics = {};
 
-    for (const p of data || []) {
+    for (const p of unique) {
       const section = p.section || "Unassigned";
       const sport = p.sport || "Unknown";
 
@@ -915,6 +964,8 @@ app.get("/analytics-summary", async (req, res) => {
       success: true,
       section_analytics: Object.values(sectionAnalytics),
       sport_analytics: Object.values(sportAnalytics),
+      raw_rows_checked: data?.length || 0,
+      deduped_rows_used: unique.length,
       last_updated: nowISO()
     });
   } catch (error) {
@@ -934,9 +985,10 @@ app.get("/trend-summary", async (req, res) => {
 
     if (error) throw error;
 
+    const unique = dedupePickHistoryRows(data || []);
     const teamMap = {};
 
-    for (const p of data || []) {
+    for (const p of unique) {
       const team = p.team_name || p.pick;
       if (!team) continue;
 
@@ -980,6 +1032,7 @@ app.get("/trend-summary", async (req, res) => {
 
     const teams = Object.values(teamMap).map(t => ({
       ...t,
+      recent_picks: t.recent_picks.slice(0, 10),
       win_rate:
         t.total ? Number(((t.wins / t.total) * 100).toFixed(1)) : 0,
       profit: Number(t.profit.toFixed(2)),
@@ -1009,7 +1062,7 @@ app.get("/trend-summary", async (req, res) => {
       )
       .slice(0, 10);
 
-    const sharpestRecentPicks = (data || [])
+    const sharpestRecentPicks = unique
       .filter(p => p.result === "Win")
       .sort((a, b) => {
         const evDiff =
@@ -1026,6 +1079,8 @@ app.get("/trend-summary", async (req, res) => {
       hottest_teams: hottestTeams,
       cold_fade_teams: coldFadeTeams,
       sharpest_recent_picks: sharpestRecentPicks,
+      raw_rows_checked: data?.length || 0,
+      deduped_rows_used: unique.length,
       last_updated: nowISO()
     });
   } catch (error) {
@@ -1045,10 +1100,13 @@ app.get("/debug-pending", async (req, res) => {
 
     if (error) throw error;
 
+    const pending = dedupePickHistoryRows(data || []);
+
     res.json({
       success: true,
-      pending_count: data?.length || 0,
-      pending: data || [],
+      pending_count: pending.length,
+      raw_pending_count: data?.length || 0,
+      pending,
       time: nowISO()
     });
   } catch (error) {
