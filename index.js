@@ -406,7 +406,28 @@ async function fetchJson(url) {
 }
 
 async function insertPickHistoryIfMissing(pick) {
-  const { data: existing, error } = await supabase
+  const conflictKey = "sport,team_name,home_team,away_team,commence_time";
+
+  const { error: upsertError } = await supabase
+    .from("pick_history")
+    .upsert([pick], {
+      onConflict: conflictKey,
+      ignoreDuplicates: true
+    });
+
+  if (!upsertError) return;
+
+  const uniqueConstraintMissing =
+    upsertError.code === "42P10" ||
+    /no unique|no exclusion constraint/i.test(upsertError.message || "");
+
+  if (!uniqueConstraintMissing) {
+    if (upsertError.code === "23505") return;
+    console.error("Pick history upsert error:", upsertError.message);
+    return;
+  }
+
+  const { data: existing, error: lookupError } = await supabase
     .from("pick_history")
     .select("id")
     .eq("sport", pick.sport)
@@ -416,8 +437,8 @@ async function insertPickHistoryIfMissing(pick) {
     .eq("commence_time", pick.commence_time)
     .limit(1);
 
-  if (error) {
-    console.error("Pick history lookup error:", error.message);
+  if (lookupError) {
+    console.error("Pick history lookup error:", lookupError.message);
     return;
   }
 
