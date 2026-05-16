@@ -881,6 +881,23 @@ function emptyTrendSummary() {
   };
 }
 
+
+function normalizeGradedRow(row) {
+  return {
+    ...row,
+    result: row?.result || row?.status || null,
+    odds:
+      row?.odds ??
+      row?.price ??
+      row?.american_odds ??
+      row?.price_american ??
+      null,
+    section: row?.section || row?.pick_section || row?.bucket || "Unassigned",
+    sport: row?.sport || row?.league || "Unknown",
+    team_name: row?.team_name || row?.pick || row?.team || null
+  };
+}
+
 async function fetchGradedHistoryRows(limit = 500) {
   const baseQuery = supabase
     .from("pick_history")
@@ -892,7 +909,7 @@ async function fetchGradedHistoryRows(limit = 500) {
   const { data, error } = await baseQuery;
   if (error) throw error;
 
-  if ((data || []).length > 0) return data;
+  if ((data || []).length > 0) return (data || []).map(normalizeGradedRow);
 
   const { data: fallbackData, error: fallbackError } = await supabase
     .from("pick_history")
@@ -903,10 +920,7 @@ async function fetchGradedHistoryRows(limit = 500) {
 
   if (fallbackError) throw fallbackError;
 
-  return (fallbackData || []).map((row) => ({
-    ...row,
-    result: row.result || row.status
-  }));
+  return (fallbackData || []).map(normalizeGradedRow);
 }
 
 app.get("/results-summary", async (req, res) => {
