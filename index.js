@@ -840,16 +840,78 @@ app.get("/grade", async (req, res) => {
   }
 });
 
+
+function emptyResultsSummary() {
+  return {
+    success: true,
+    total: 0,
+    total_graded: 0,
+    wins: 0,
+    losses: 0,
+    win_rate: 0,
+    profit: 0,
+    roi: 0,
+    raw_rows_checked: 0,
+    deduped_rows_used: 0,
+    recent_results: [],
+    last_updated: nowISO()
+  };
+}
+
+function emptyAnalyticsSummary() {
+  return {
+    success: true,
+    section_analytics: [],
+    sport_analytics: [],
+    raw_rows_checked: 0,
+    deduped_rows_used: 0,
+    last_updated: nowISO()
+  };
+}
+
+function emptyTrendSummary() {
+  return {
+    success: true,
+    hottest_teams: [],
+    cold_fade_teams: [],
+    sharpest_recent_picks: [],
+    raw_rows_checked: 0,
+    deduped_rows_used: 0,
+    last_updated: nowISO()
+  };
+}
+
+async function fetchGradedHistoryRows(limit = 500) {
+  const baseQuery = supabase
+    .from("pick_history")
+    .select("*")
+    .in("result", ["Win", "Loss"])
+    .order("graded_at", { ascending: false })
+    .limit(limit);
+
+  const { data, error } = await baseQuery;
+  if (error) throw error;
+
+  if ((data || []).length > 0) return data;
+
+  const { data: fallbackData, error: fallbackError } = await supabase
+    .from("pick_history")
+    .select("*")
+    .in("status", ["Win", "Loss"])
+    .order("graded_at", { ascending: false })
+    .limit(limit);
+
+  if (fallbackError) throw fallbackError;
+
+  return (fallbackData || []).map((row) => ({
+    ...row,
+    result: row.result || row.status
+  }));
+}
+
 app.get("/results-summary", async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("pick_history")
-      .select("*")
-      .in("result", ["Win", "Loss"])
-      .order("graded_at", { ascending: false })
-      .limit(500);
-
-    if (error) throw error;
+    const data = await fetchGradedHistoryRows(500);
 
     const unique = dedupePickHistoryRows(data || []);
 
@@ -873,6 +935,7 @@ app.get("/results-summary", async (req, res) => {
     res.json({
       success: true,
       total,
+      total_graded: total,
       wins,
       losses,
       win_rate: winRate,
@@ -885,20 +948,17 @@ app.get("/results-summary", async (req, res) => {
     });
   } catch (error) {
     console.error("RESULTS SUMMARY ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(200).json({
+      ...emptyResultsSummary(),
+      success: false,
+      error: error.message
+    });
   }
 });
 
 app.get("/analytics-summary", async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("pick_history")
-      .select("*")
-      .in("result", ["Win", "Loss"])
-      .order("graded_at", { ascending: false })
-      .limit(500);
-
-    if (error) throw error;
+    const data = await fetchGradedHistoryRows(500);
 
     const unique = dedupePickHistoryRows(data || []);
     const sectionAnalytics = {};
@@ -991,20 +1051,17 @@ app.get("/analytics-summary", async (req, res) => {
     });
   } catch (error) {
     console.error("ANALYTICS SUMMARY ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(200).json({
+      ...emptyAnalyticsSummary(),
+      success: false,
+      error: error.message
+    });
   }
 });
 
 app.get("/trend-summary", async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("pick_history")
-      .select("*")
-      .in("result", ["Win", "Loss"])
-      .order("graded_at", { ascending: false })
-      .limit(500);
-
-    if (error) throw error;
+    const data = await fetchGradedHistoryRows(500);
 
     const unique = dedupePickHistoryRows(data || []);
     const teamMap = {};
@@ -1106,7 +1163,11 @@ app.get("/trend-summary", async (req, res) => {
     });
   } catch (error) {
     console.error("TREND SUMMARY ERROR:", error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(200).json({
+      ...emptyTrendSummary(),
+      success: false,
+      error: error.message
+    });
   }
 });
 
