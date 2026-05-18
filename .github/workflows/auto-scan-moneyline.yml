@@ -1,0 +1,29 @@
+name: Auto Scan Moneyline Picks
+
+on:
+  schedule:
+    # Runs every 4 hours. GitHub cron uses UTC.
+    # This keeps picks refreshed without hammering The Odds API too hard.
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  auto-scan-moneyline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Call SmartBet moneyline scan endpoint
+        run: |
+          set -e
+          echo "Calling SmartBet moneyline /scan endpoint..."
+          RESPONSE=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "https://smartbet-scanner-production.up.railway.app/scan")
+          echo "$RESPONSE"
+          HTTP_STATUS=$(echo "$RESPONSE" | awk -F: '/HTTP_STATUS/ {print $2}')
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Auto scan failed with HTTP status $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "Moneyline auto scan completed successfully."
