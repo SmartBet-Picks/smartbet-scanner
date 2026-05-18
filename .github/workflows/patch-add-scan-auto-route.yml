@@ -1,0 +1,240 @@
+name: Patch Backend Auto Scan Route
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-scan-auto-route:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Patch index.js and auto scan workflow
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          index_path = Path('index.js')
+          text = index_path.read_text()
+
+          route_code = r'''
+app.get("/scan-auto", async (req, res) => {
+  try {
+    const sportResults = await Promise.allSettled(
+      SPORTS.map(async sport => {
+        const picks = [];
+        const skippedGames = [];
+        const filteredPicks = [];
+
+        const url =
+          `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
+          `?apiKey=${ODDS_API_KEY}` +
+          `&regions=${REGIONS}` +
+          `&markets=${MARKETS}` +
+          `&oddsFormat=${ODDS_FORMAT}` +
+          `&bookmakers=${BOOKMAKER_KEY}`;
+
+        const games = await fetchJson(url);
+
+        for (const game of games || []) {
+          if (!smartbetIsValidScannerGame(game, sport.key)) {
+            skippedGames.push({ sport: sport.label });
+            continue;
+          }
+
+          const bookmaker = (game.bookmakers || []).find(
+            b => b.key === BOOKMAKER_KEY
+          );
+
+          if (!bookmaker) continue;
+
+          const market = (bookmaker.markets || []).find(m => m.key === MARKETS);
+          if (!market || !market.outcomes) continue;
+
+          for (const outcome of market.outcomes) {
+            const teamName = outcome.name;
+            const odds = Number(outcome.price);
+
+            if (!teamName || !Number.isFinite(odds)) continue;
+
+            const normalizedTeam = normalizeTeam(teamName);
+            const validTeam =
+              normalizedTeam === normalizeTeam(game.home_team) ||
+              normalizedTeam === normalizeTeam(game.away_team);
+
+            if (!validTeam) continue;
+
+            const impliedRaw = americanToImpliedProbability(odds);
+
+            const confidence = confidenceEngineV26({
+              odds,
+              homeTeam: game.home_team,
+              teamName
+            });
+
+            const edge = calculateEdge(impliedRaw, confidence);
+            const expectedValue = calculateExpectedValue(odds, confidence);
+            const marketConfidence = getMarketConfidence(impliedRaw, odds);
+            const volatility = getVolatility(odds, impliedRaw);
+
+            const trapWarning = getTrapWarning({
+              odds,
+              impliedProbability: impliedRaw,
+              confidence,
+              edge,
+              expectedValue
+            });
+
+            const timingFlags = getTimingFlags(game.commence_time);
+
+            const pick = {
+              sport: sport.label,
+              sport_key: sport.key,
+              event_id: game.id || null,
+              game: `${game.away_team} @ ${game.home_team}`,
+              home_team: game.home_team,
+              away_team: game.away_team,
+              team_name: teamName,
+              pick: teamName,
+              market: "Moneyline",
+              bookmaker: "DraftKings",
+              odds,
+              implied_probability:
+                impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
+              confidence,
+              edge,
+              expected_value: expectedValue,
+              risk: getRiskLabel(confidence, odds),
+              market_confidence: marketConfidence,
+              volatility,
+              trap_warning: trapWarning,
+              commence_time: game.commence_time,
+              game_date: toDateOnly(game.commence_time),
+              today_play: timingFlags.today_play,
+              early_value: timingFlags.early_value,
+              hours_until_game: timingFlags.hours_until_game,
+              event_time_label: timingFlags.event_time_label,
+              status: "Pending",
+              result: "Pending",
+              actual_result: null,
+              graded_at: null,
+              created_at: nowISO(),
+              updated_at: nowISO()
+            };
+
+            if (!passesEVFilter(pick)) {
+              filteredPicks.push({ sport: sport.label });
+              continue;
+            }
+
+            picks.push(pick);
+          }
+        }
+
+        return { sport: sport.label, picks, skippedGames, filteredPicks };
+      })
+    );
+
+    const allPicks = [];
+    const skippedGames = [];
+    const filteredPicks = [];
+    const failedSports = [];
+
+    for (const result of sportResults) {
+      if (result.status === "fulfilled") {
+        allPicks.push(...result.value.picks);
+        skippedGames.push(...result.value.skippedGames);
+        filteredPicks.push(...result.value.filteredPicks);
+      } else {
+        failedSports.push(result.reason?.message || "Unknown sport scan error");
+      }
+    }
+
+    const onePickPerGame = uniqueByGameBestSide(allPicks);
+
+    const finalPicks = assignSections(onePickPerGame)
+      .sort((a, b) => {
+        const todayA = a.today_play ? 1 : 0;
+        const todayB = b.today_play ? 1 : 0;
+
+        if (todayB - todayA !== 0) return todayB - todayA;
+
+        const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
+        if (evDiff !== 0) return evDiff;
+
+        const edgeDiff = Number(b.edge || 0) - Number(a.edge || 0);
+        if (edgeDiff !== 0) return edgeDiff;
+
+        return Number(b.confidence || 0) - Number(a.confidence || 0);
+      })
+      .slice(0, 40);
+
+    await supabase.from("picks").delete().neq("id", 0);
+
+    if (finalPicks.length > 0) {
+      const { error } = await supabase.from("picks").insert(finalPicks);
+      if (error) throw error;
+
+      for (const pick of finalPicks) {
+        await insertPickHistoryIfMissing(pick);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Lightweight auto scan complete",
+      route: "/scan-auto",
+      bookmaker: "DraftKings",
+      market: "Moneyline",
+      total_raw_picks_before_best_side_filter: allPicks.length,
+      total_saved: finalPicks.length,
+      today_top_plays_count: finalPicks.filter(p => p.today_play).length,
+      early_value_plays_count: finalPicks.filter(p => p.early_value).length,
+      skipped_games_count: skippedGames.length,
+      ev_filtered_picks_count: filteredPicks.length,
+      failed_sports_count: failedSports.length,
+      failed_sports: failedSports,
+      time: nowISO()
+    });
+  } catch (error) {
+    console.error("AUTO SCAN ERROR:", error);
+    res.status(500).json({ success: false, route: "/scan-auto", error: error.message });
+  }
+});
+'''
+
+          if 'app.get("/scan-auto"' not in text:
+            marker = 'app.get("/scan", async (req, res) => {'
+            if marker not in text:
+              raise SystemExit('Could not find /scan route marker in index.js')
+            text = text.replace(marker, route_code + '\n' + marker, 1)
+
+          if '"/scan-auto",' not in text:
+            text = text.replace('"/scan",', '"/scan",\n      "/scan-auto",', 1)
+
+          index_path.write_text(text)
+
+          workflow_path = Path('.github/workflows/auto-scan-moneyline.yml')
+          workflow = workflow_path.read_text()
+          workflow = workflow.replace('https://smartbet-scanner-production.up.railway.app/scan', 'https://smartbet-scanner-production.up.railway.app/scan-auto')
+          workflow = workflow.replace('Calling SmartBet moneyline /scan endpoint...', 'Calling SmartBet moneyline /scan-auto endpoint...')
+          workflow = workflow.replace('Moneyline auto scan completed successfully.', 'Moneyline /scan-auto completed successfully.')
+          workflow_path.write_text(workflow)
+          PY
+
+      - name: Commit backend patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.js .github/workflows/auto-scan-moneyline.yml
+          if git diff --cached --quiet; then
+            echo "No changes needed."
+          else
+            git commit -m "Add lightweight scan-auto route for scheduled moneyline scans"
+            git push
+          fi
