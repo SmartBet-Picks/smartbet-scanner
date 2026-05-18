@@ -1,0 +1,28 @@
+name: Auto Grade Moneyline Picks
+
+on:
+  schedule:
+    # Runs every 30 minutes. GitHub cron uses UTC.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  auto-grade-moneyline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Call SmartBet moneyline grade endpoint
+        run: |
+          set -e
+          echo "Calling SmartBet moneyline /grade endpoint..."
+          RESPONSE=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" "https://smartbet-scanner-production.up.railway.app/grade")
+          echo "$RESPONSE"
+          HTTP_STATUS=$(echo "$RESPONSE" | awk -F: '/HTTP_STATUS/ {print $2}')
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Auto grading failed with HTTP status $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "Moneyline auto grading completed successfully."
