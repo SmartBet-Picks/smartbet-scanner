@@ -27,14 +27,14 @@ jobs:
         run: |
           set -e
 
-          echo "Calling SmartBet moneyline /scan-auto endpoint..."
+          echo "Calling SmartBet moneyline /scan endpoint..."
 
           RESPONSE=$(curl --retry 5 \
             --retry-delay 15 \
             --max-time 300 \
             -sS \
             -w "\nHTTP_STATUS:%{http_code}" \
-            "https://smartbet-scanner-production.up.railway.app/scan-auto")
+            "https://smartbet-scanner-production.up.railway.app/scan")
 
           echo "$RESPONSE"
 
