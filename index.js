@@ -454,6 +454,260 @@ async function insertPickHistoryIfMissing(pick) {
   }
 }
 
+function oddsApiMoneylineUrl(sportKey) {
+  return (
+    `https://api.the-odds-api.com/v4/sports/${sportKey}/odds` +
+    `?apiKey=${ODDS_API_KEY}` +
+    `&regions=${REGIONS}` +
+    `&markets=${MARKETS}` +
+    `&oddsFormat=${ODDS_FORMAT}` +
+    `&bookmakers=${BOOKMAKER_KEY}`
+  );
+}
+
+async function scanSportMoneyline(sport) {
+  const allPicks = [];
+  const skippedGames = [];
+  const filteredPicks = [];
+  const games = await fetchJson(oddsApiMoneylineUrl(sport.key));
+
+  for (const game of games || []) {
+    if (!smartbetIsValidScannerGame(game, sport.key)) {
+      skippedGames.push({
+        sport: sport.label,
+        game: `${game?.away_team || "Unknown"} @ ${game?.home_team || "Unknown"}`,
+        commence_time: game?.commence_time || null,
+        reason:
+          "Filtered out: offseason, old, far-future, missing teams, or futures-style market"
+      });
+      continue;
+    }
+
+    const bookmaker = (game.bookmakers || []).find(
+      b => b.key === BOOKMAKER_KEY
+    );
+
+    if (!bookmaker) continue;
+
+    const market = (bookmaker.markets || []).find(m => m.key === MARKETS);
+    if (!market || !market.outcomes) continue;
+
+    for (const outcome of market.outcomes) {
+      const teamName = outcome.name;
+      const odds = Number(outcome.price);
+
+      if (!teamName || !Number.isFinite(odds)) continue;
+
+      const normalizedTeam = normalizeTeam(teamName);
+      const validTeam =
+        normalizedTeam === normalizeTeam(game.home_team) ||
+        normalizedTeam === normalizeTeam(game.away_team);
+
+      if (!validTeam) continue;
+
+      const impliedRaw = americanToImpliedProbability(odds);
+
+      const confidence = confidenceEngineV26({
+        odds,
+        homeTeam: game.home_team,
+        teamName
+      });
+
+      const edge = calculateEdge(impliedRaw, confidence);
+      const expectedValue = calculateExpectedValue(odds, confidence);
+      const marketConfidence = getMarketConfidence(impliedRaw, odds);
+      const volatility = getVolatility(odds, impliedRaw);
+
+      const trapWarning = getTrapWarning({
+        odds,
+        impliedProbability: impliedRaw,
+        confidence,
+        edge,
+        expectedValue
+      });
+
+      const timingFlags = getTimingFlags(game.commence_time);
+
+      const pick = {
+        sport: sport.label,
+        sport_key: sport.key,
+        event_id: game.id || null,
+        game: `${game.away_team} @ ${game.home_team}`,
+        home_team: game.home_team,
+        away_team: game.away_team,
+        team_name: teamName,
+        pick: teamName,
+        market: "Moneyline",
+        bookmaker: "DraftKings",
+        odds,
+        implied_probability:
+          impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
+        confidence,
+        edge,
+        expected_value: expectedValue,
+        risk: getRiskLabel(confidence, odds),
+        market_confidence: marketConfidence,
+        volatility,
+        trap_warning: trapWarning,
+        commence_time: game.commence_time,
+        game_date: toDateOnly(game.commence_time),
+        today_play: timingFlags.today_play,
+        early_value: timingFlags.early_value,
+        hours_until_game: timingFlags.hours_until_game,
+        event_time_label: timingFlags.event_time_label,
+        status: "Pending",
+        result: "Pending",
+        actual_result: null,
+        graded_at: null,
+        created_at: nowISO(),
+        updated_at: nowISO()
+      };
+
+      if (!passesEVFilter(pick)) {
+        filteredPicks.push({
+          sport: sport.label,
+          game: pick.game,
+          pick: pick.pick,
+          odds: pick.odds,
+          confidence: pick.confidence,
+          edge: pick.edge,
+          expected_value: pick.expected_value,
+          today_play: pick.today_play,
+          early_value: pick.early_value,
+          hours_until_game: pick.hours_until_game,
+          event_time_label: pick.event_time_label,
+          reason: "Filtered out by EV/edge/favorite-trap rules"
+        });
+        continue;
+      }
+
+      allPicks.push(pick);
+    }
+  }
+
+  return { allPicks, skippedGames, filteredPicks };
+}
+
+function finalizeMoneylinePicks(allPicks) {
+  const onePickPerGame = uniqueByGameBestSide(allPicks);
+
+  return assignSections(onePickPerGame)
+    .sort((a, b) => {
+      const todayA = a.today_play ? 1 : 0;
+      const todayB = b.today_play ? 1 : 0;
+
+      if (todayB - todayA !== 0) return todayB - todayA;
+
+      const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
+      if (evDiff !== 0) return evDiff;
+
+      const edgeDiff = Number(b.edge || 0) - Number(a.edge || 0);
+      if (edgeDiff !== 0) return edgeDiff;
+
+      return Number(b.confidence || 0) - Number(a.confidence || 0);
+    })
+    .slice(0, 40);
+}
+
+async function saveMoneylinePicks(finalPicks) {
+  await supabase.from("picks").delete().neq("id", 0);
+
+  if (finalPicks.length === 0) return;
+
+  const { error } = await supabase.from("picks").insert(finalPicks);
+  if (error) throw error;
+
+  for (const pick of finalPicks) {
+    await insertPickHistoryIfMissing(pick);
+  }
+}
+
+function moneylineScanSummary({
+  route,
+  allPicks,
+  finalPicks,
+  skippedGames,
+  filteredPicks,
+  failedSports
+}) {
+  return {
+    success: true,
+    message:
+      "Clean EV scan complete with Today's Top Plays + Early Value Plays + One Pick Per Game",
+    route,
+    bookmaker: "DraftKings",
+    market: "Moneyline",
+    total_raw_picks_before_best_side_filter: allPicks.length,
+    total_saved: finalPicks.length,
+    today_top_plays_count: finalPicks.filter(p => p.today_play).length,
+    early_value_plays_count: finalPicks.filter(p => p.early_value).length,
+    skipped_games_count: skippedGames.length,
+    ev_filtered_picks_count: filteredPicks.length,
+    failed_sports_count: failedSports.length,
+    failed_sports: failedSports,
+    time: nowISO()
+  };
+}
+
+async function runMoneylineScan({ continueOnSportError = false } = {}) {
+  const allPicks = [];
+  const skippedGames = [];
+  const filteredPicks = [];
+  const failedSports = [];
+  let successfulSportsCount = 0;
+
+  if (continueOnSportError) {
+    const results = await Promise.allSettled(
+      SPORTS.map(async sport => ({
+        sport,
+        result: await scanSportMoneyline(sport)
+      }))
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        allPicks.push(...result.value.result.allPicks);
+        skippedGames.push(...result.value.result.skippedGames);
+        filteredPicks.push(...result.value.result.filteredPicks);
+        successfulSportsCount += 1;
+        return;
+      }
+
+      const reason = result.reason?.message || String(result.reason);
+      const sport = SPORTS[index];
+
+      failedSports.push({
+        sport: sport?.label || "Unknown",
+        sport_key: sport?.key || null,
+        error: reason
+      });
+    });
+
+    if (successfulSportsCount === 0 && failedSports.length > 0) {
+      throw new Error("All sports failed during auto scan");
+    }
+  } else {
+    for (const sport of SPORTS) {
+      const result = await scanSportMoneyline(sport);
+      allPicks.push(...result.allPicks);
+      skippedGames.push(...result.skippedGames);
+      filteredPicks.push(...result.filteredPicks);
+      successfulSportsCount += 1;
+    }
+  }
+
+  const finalPicks = finalizeMoneylinePicks(allPicks);
+  await saveMoneylinePicks(finalPicks);
+
+  return {
+    allPicks,
+    skippedGames,
+    filteredPicks,
+    finalPicks,
+    failedSports
+  };
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "SmartBet Railway backend running",
@@ -465,6 +719,7 @@ app.get("/", (req, res) => {
     routes: [
       "/",
       "/scan",
+      "/scan-auto",
       "/grade",
       "/results-summary",
       "/analytics-summary",
@@ -478,183 +733,27 @@ app.get("/", (req, res) => {
 
 app.get("/scan", async (req, res) => {
   try {
-    const allPicks = [];
-    const skippedGames = [];
-    const filteredPicks = [];
-
-    for (const sport of SPORTS) {
-      const url =
-        `https://api.the-odds-api.com/v4/sports/${sport.key}/odds` +
-        `?apiKey=${ODDS_API_KEY}` +
-        `&regions=${REGIONS}` +
-        `&markets=${MARKETS}` +
-        `&oddsFormat=${ODDS_FORMAT}` +
-        `&bookmakers=${BOOKMAKER_KEY}`;
-
-      const games = await fetchJson(url);
-
-      for (const game of games || []) {
-        if (!smartbetIsValidScannerGame(game, sport.key)) {
-          skippedGames.push({
-            sport: sport.label,
-            game: `${game?.away_team || "Unknown"} @ ${game?.home_team || "Unknown"}`,
-            commence_time: game?.commence_time || null,
-            reason:
-              "Filtered out: offseason, old, far-future, missing teams, or futures-style market"
-          });
-          continue;
-        }
-
-        const bookmaker = (game.bookmakers || []).find(
-          b => b.key === BOOKMAKER_KEY
-        );
-
-        if (!bookmaker) continue;
-
-        const market = (bookmaker.markets || []).find(m => m.key === MARKETS);
-        if (!market || !market.outcomes) continue;
-
-        for (const outcome of market.outcomes) {
-          const teamName = outcome.name;
-          const odds = Number(outcome.price);
-
-          if (!teamName || !Number.isFinite(odds)) continue;
-
-          const normalizedTeam = normalizeTeam(teamName);
-          const validTeam =
-            normalizedTeam === normalizeTeam(game.home_team) ||
-            normalizedTeam === normalizeTeam(game.away_team);
-
-          if (!validTeam) continue;
-
-          const impliedRaw = americanToImpliedProbability(odds);
-
-          const confidence = confidenceEngineV26({
-            odds,
-            homeTeam: game.home_team,
-            teamName
-          });
-
-          const edge = calculateEdge(impliedRaw, confidence);
-          const expectedValue = calculateExpectedValue(odds, confidence);
-          const marketConfidence = getMarketConfidence(impliedRaw, odds);
-          const volatility = getVolatility(odds, impliedRaw);
-
-          const trapWarning = getTrapWarning({
-            odds,
-            impliedProbability: impliedRaw,
-            confidence,
-            edge,
-            expectedValue
-          });
-
-          const timingFlags = getTimingFlags(game.commence_time);
-
-          const pick = {
-            sport: sport.label,
-            sport_key: sport.key,
-            event_id: game.id || null,
-            game: `${game.away_team} @ ${game.home_team}`,
-            home_team: game.home_team,
-            away_team: game.away_team,
-            team_name: teamName,
-            pick: teamName,
-            market: "Moneyline",
-            bookmaker: "DraftKings",
-            odds,
-            implied_probability:
-              impliedRaw == null ? null : Number((impliedRaw * 100).toFixed(2)),
-            confidence,
-            edge,
-            expected_value: expectedValue,
-            risk: getRiskLabel(confidence, odds),
-            market_confidence: marketConfidence,
-            volatility,
-            trap_warning: trapWarning,
-            commence_time: game.commence_time,
-            game_date: toDateOnly(game.commence_time),
-            today_play: timingFlags.today_play,
-            early_value: timingFlags.early_value,
-            hours_until_game: timingFlags.hours_until_game,
-            event_time_label: timingFlags.event_time_label,
-            status: "Pending",
-            result: "Pending",
-            actual_result: null,
-            graded_at: null,
-            created_at: nowISO(),
-            updated_at: nowISO()
-          };
-
-          if (!passesEVFilter(pick)) {
-            filteredPicks.push({
-              sport: sport.label,
-              game: pick.game,
-              pick: pick.pick,
-              odds: pick.odds,
-              confidence: pick.confidence,
-              edge: pick.edge,
-              expected_value: pick.expected_value,
-              today_play: pick.today_play,
-              early_value: pick.early_value,
-              hours_until_game: pick.hours_until_game,
-              event_time_label: pick.event_time_label,
-              reason: "Filtered out by EV/edge/favorite-trap rules"
-            });
-            continue;
-          }
-
-          allPicks.push(pick);
-        }
-      }
-    }
-
-    const onePickPerGame = uniqueByGameBestSide(allPicks);
-
-    const finalPicks = assignSections(onePickPerGame)
-      .sort((a, b) => {
-        const todayA = a.today_play ? 1 : 0;
-        const todayB = b.today_play ? 1 : 0;
-
-        if (todayB - todayA !== 0) return todayB - todayA;
-
-        const evDiff = Number(b.expected_value || 0) - Number(a.expected_value || 0);
-        if (evDiff !== 0) return evDiff;
-
-        const edgeDiff = Number(b.edge || 0) - Number(a.edge || 0);
-        if (edgeDiff !== 0) return edgeDiff;
-
-        return Number(b.confidence || 0) - Number(a.confidence || 0);
-      })
-      .slice(0, 40);
-
-    await supabase.from("picks").delete().neq("id", 0);
-
-    if (finalPicks.length > 0) {
-      const { error } = await supabase.from("picks").insert(finalPicks);
-      if (error) throw error;
-
-      for (const pick of finalPicks) {
-        await insertPickHistoryIfMissing(pick);
-      }
-    }
+    const {
+      allPicks,
+      skippedGames,
+      filteredPicks,
+      finalPicks,
+      failedSports
+    } = await runMoneylineScan();
 
     res.json({
-      success: true,
-      message:
-        "Clean EV scan complete with Today’s Top Plays + Early Value Plays + One Pick Per Game",
+      ...moneylineScanSummary({
+        route: "/scan",
+        allPicks,
+        finalPicks,
+        skippedGames,
+        filteredPicks,
+        failedSports
+      }),
       filter_note:
         "NFL is enabled, UFC is enabled, and future UFC picks are labeled Early Value. Offseason/futures/far-future markets remain blocked. EV filter blocks weak favorites, negative EV, low edge, and low-confidence plays. One-pick-per-game logic prevents both sides from appearing.",
-      bookmaker: "DraftKings",
-      market: "Moneyline",
-      total_raw_picks_before_best_side_filter: allPicks.length,
-      total_saved: finalPicks.length,
-      today_top_plays_count: finalPicks.filter(p => p.today_play).length,
-      early_value_plays_count: finalPicks.filter(p => p.early_value).length,
-      skipped_games_count: skippedGames.length,
-      ev_filtered_picks_count: filteredPicks.length,
       top_5_count: finalPicks.filter(p => p.section === "Top 5 Locks").length,
       free_pick_count: finalPicks.filter(p => p.section === "Free Pick").length,
-      time: nowISO(),
       picks: finalPicks,
       today_top_plays: finalPicks.filter(p => p.today_play),
       early_value_plays: finalPicks.filter(p => p.early_value),
@@ -664,6 +763,45 @@ app.get("/scan", async (req, res) => {
   } catch (error) {
     console.error("SCAN ERROR:", error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/scan-auto", async (req, res) => {
+  try {
+    const scan = await runMoneylineScan({ continueOnSportError: true });
+
+    res.json(
+      moneylineScanSummary({
+        route: "/scan-auto",
+        allPicks: scan.allPicks,
+        finalPicks: scan.finalPicks,
+        skippedGames: scan.skippedGames,
+        filteredPicks: scan.filteredPicks,
+        failedSports: scan.failedSports
+      })
+    );
+  } catch (error) {
+    console.error("SCAN AUTO ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Auto scan failed before successful sport picks could be saved",
+      route: "/scan-auto",
+      bookmaker: "DraftKings",
+      market: "Moneyline",
+      total_raw_picks_before_best_side_filter: 0,
+      total_saved: 0,
+      today_top_plays_count: 0,
+      early_value_plays_count: 0,
+      skipped_games_count: 0,
+      ev_filtered_picks_count: 0,
+      failed_sports_count: SPORTS.length,
+      failed_sports: SPORTS.map(sport => ({
+        sport: sport.label,
+        sport_key: sport.key,
+        error: error.message
+      })),
+      time: nowISO()
+    });
   }
 });
 
