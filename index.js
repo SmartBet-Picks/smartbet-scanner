@@ -774,15 +774,17 @@ app.get("/scan-auto", (req, res) => {
     message: "Background auto scan started"
   });
 
-  console.log("AUTO SCAN STARTED");
+  setImmediate(() => {
+    console.log("AUTO SCAN STARTED");
 
-  runMoneylineScan({ continueOnSportError: true })
-    .then(() => {
-      console.log("AUTO SCAN FINISHED");
-    })
-    .catch(error => {
-      console.error("AUTO SCAN ERROR", error);
-    });
+    runMoneylineScan({ continueOnSportError: true })
+      .then(() => {
+        console.log("AUTO SCAN FINISHED");
+      })
+      .catch(error => {
+        console.error("AUTO SCAN ERROR", error);
+      });
+  });
 });
 
 app.get("/grade", async (req, res) => {
