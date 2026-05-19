@@ -766,43 +766,23 @@ app.get("/scan", async (req, res) => {
   }
 });
 
-app.get("/scan-auto", async (req, res) => {
-  try {
-    const scan = await runMoneylineScan({ continueOnSportError: true });
+app.get("/scan-auto", (req, res) => {
+  res.json({
+    success: true,
+    started: true,
+    route: "/scan-auto",
+    message: "Background auto scan started"
+  });
 
-    res.json(
-      moneylineScanSummary({
-        route: "/scan-auto",
-        allPicks: scan.allPicks,
-        finalPicks: scan.finalPicks,
-        skippedGames: scan.skippedGames,
-        filteredPicks: scan.filteredPicks,
-        failedSports: scan.failedSports
-      })
-    );
-  } catch (error) {
-    console.error("SCAN AUTO ERROR:", error);
-    res.status(500).json({
-      success: false,
-      message: "Auto scan failed before successful sport picks could be saved",
-      route: "/scan-auto",
-      bookmaker: "DraftKings",
-      market: "Moneyline",
-      total_raw_picks_before_best_side_filter: 0,
-      total_saved: 0,
-      today_top_plays_count: 0,
-      early_value_plays_count: 0,
-      skipped_games_count: 0,
-      ev_filtered_picks_count: 0,
-      failed_sports_count: SPORTS.length,
-      failed_sports: SPORTS.map(sport => ({
-        sport: sport.label,
-        sport_key: sport.key,
-        error: error.message
-      })),
-      time: nowISO()
+  console.log("AUTO SCAN STARTED");
+
+  runMoneylineScan({ continueOnSportError: true })
+    .then(() => {
+      console.log("AUTO SCAN FINISHED");
+    })
+    .catch(error => {
+      console.error("AUTO SCAN ERROR", error);
     });
-  }
 });
 
 app.get("/grade", async (req, res) => {
